@@ -1,0 +1,9 @@
+# genyee-dsh-plugins
+
+Genyee 的 DSH 树外插件仓库。
+
+| 包 | 状态 | 说明 |
+|---|---|---|
+| `@genyee/dsh-keyhub` | 设计中 | 企业 DeepSeek Key 集中管控：管理员 DSH 内网转发并强制写入 `user_id`，员工只持有可吊销的授权码 |
+
+方向与里程碑见 [GENYEE_KEYHUB_DIRECTION.md](GENYEE_KEYHUB_DIRECTION.md)。

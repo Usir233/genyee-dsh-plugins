@@ -2,3 +2,6 @@ node_modules/
 lib/
 *.tgz
 .env
+
+# Released plugin packages are kept in the repository.
+!releases/**/*.tgz

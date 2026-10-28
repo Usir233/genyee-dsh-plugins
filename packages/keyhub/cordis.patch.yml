@@ -12,6 +12,11 @@
     provider: genyee-keyhub
     model: deepseek-flash
 
-# The relay also strips this field; disabling the row keeps it out of every request.
+# The relay strips every dsh_ body extension; turning the contributors off keeps
+# them from being prepared at all.
 - id: plugin-package-inventory-deepseek
   disabled: true
+
+- id: session-log-deepseek
+  config:
+    enabled: false

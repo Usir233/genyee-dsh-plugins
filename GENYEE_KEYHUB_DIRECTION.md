@@ -1,6 +1,6 @@
 # Genyee 密钥中心（`@genyee/dsh-keyhub`）方向文档
 
-> 状态：方向已定，进入 M0 技术验证。
+> 状态：方向已定；M1 转发闭环已实现（`dev` 分支），M0 验证进行中，见 §6。
 > 基线：上游 `@deepseek-ai/dsh-root` `0.2.2-alpha.2`。
 > 关系：本文取代 `Usir233/DSH-GENYEE` 仓库中的 DSH_ENTERPRISE_PLAN.md 的第 5 节（模式 A/B 选型）和第 6 节中与密钥、网关相关的工作流；该文档其余部分作为背景材料保留。
 
@@ -21,13 +21,14 @@
 | D5 | `user_id` 由管理端按授权码**强制覆盖**写入，忽略客户端传来的值 | 客户端写的 `user_id` 可伪造：员工能冒用同事身份，内容安全违规会记到别人头上，单人并发上限也会被绕开 | 员工端经 `deepseekLlmApiExtensions` 注入 |
 | D6 | 转发服务运行在**管理员的 DSH 进程内**；管理员 DSH 必须常开，否则员工无法使用 | 你已接受该代价；不需要另外部署服务 | 独立服务器上的网关 |
 | D7 | 转发服务由插件自己用 `node:http` / `node:https` 监听，不依赖 `dsh-host-webserver` | 已核实 `dsh-host-webserver` 只组合在 `web-app` 组合包里；桌面端经 `file://` + IPC 加载界面，没有 HTTP 服务器 | 原模式 B 写的"复用宿主 `ctx.webserver`" |
-| D8 | 员工端注册**自己的** DeepSeek 路由 `genyee-keyhub`，复用上游公开导出的 `registerDeepSeekProvider`；不修改官方路由 `llm-deepseek-api-key` 的配置 | 员工端只需一个插件即可工作；模型选择器里显示为独立的"Genyee"路由 | 改写官方路由的 `baseURL` 和 `apiKeyEnv` |
+| D8 | 员工端注册**自己的** DeepSeek 路由 `genyee-keyhub`，复用上游公开导出的 `registerDeepSeekProvider`；该路由把请求发给员工端插件在本机 `127.0.0.1` 开的中转端口，再由中转转发给管理端；不修改官方路由 `llm-deepseek-api-key` 的配置 | 员工端只需一个插件即可工作；上游适配器用全局 `fetch` 发请求，无法按请求核对证书，本机中转负责核对（D15） | 改写官方路由的 `baseURL` 和 `apiKeyEnv` |
 | D9 | 管理员自己使用 DSH 时，也走本机转发（回环地址），身份为自动创建的"管理员"员工条目 | 管理员的请求同样带 `user_id`、计入用量，两种模式行为对称 | 管理员直接用官方路由 |
-| D10 | 管理端转发时删除 `dsh_plugin_packages` 请求体字段和 `x-deepseek-harness-user-id` 请求头 | 已核实：上游会向 DeepSeek 请求附带启用的插件包清单和设备匿名 ID；企业场景不需要外发 | 原样透传 |
+| D10 | 管理端转发时删除所有 `dsh_` 开头的请求体扩展字段和 `x-deepseek-harness-user-id` 请求头；组合包同时关闭插件清单（`plugin-package-inventory-deepseek`）和会话日志上传（`session-log-deepseek`） | 已核实：上游默认随每个模型请求向 DeepSeek 上传启用的插件包清单（`dsh_plugin_packages`）、**整个会话的事件日志**（`dsh_session_log`，含工具输出、文件内容、工作目录）和设备匿名 ID；企业场景不应外发这些非推理数据 | 原样透传 |
 | D11 | 以 `.tgz` 包分发，用 `dsh plugin --profile <name> add ./genyee-dsh-keyhub-<version>.tgz` 安装；`package.json` 声明精确的 `engines.dsh` 范围 | 客户内网不一定能访问 npm；`engines.dsh` 不兼容时启动器跳过该组合包，不会带病运行 | 公共 npm 发布 |
 | D12 | 同一个 DeepSeek 账号下给每个部门开一个 Key；管理端按员工所属部门选用 Key；并发不够时向官方申请扩容 | 一个部门的 Key 出问题只换这一个；同账号下所有 Key 共用一个余额和一份账单，部门预算由管理端执行（D13） | 每个部门一个 DeepSeek 账号 |
 | D13 | 额度按**金额**计，分**部门**和**员工**两级，请求须两级都有余额才放行；另按员工限制可用模型和并发数（§5.4） | 管理端是唯一出口，员工无法绕过；金额比 token 更贴近财务预算 | 只按 token 计；只设员工一级 |
 | D14 | 不再维护 fork 仓库 `DSH-GENYEE` 的同步；跟进上游的方式是用上游新版本测试插件，通过后更新 `engines.dsh` 并发布插件新版本 | 插件依赖上游已发布的 npm 包、运行在官方 DSH 中，交付不需要 fork | 定期同步 fork |
+| D15 | 公司没有内部 CA：管理端使用自签证书；管理员发给员工的是**接入码**（管理端地址 + 证书 SHA-256 指纹 + 授权码）；员工端本机中转只接受指纹相符的证书，握手核对通过前不发送任何请求字节 | 员工无需安装证书或修改系统设置，Windows、macOS 相同；冒充管理端拿不到授权码 | 员工电脑安装证书；明文 HTTP |
 
 ## 3. 威胁模型
 
@@ -67,20 +68,22 @@
 | 字段 | 模式 | 含义 |
 |---|---|---|
 | `role` | 两者 | `admin` 或 `employee` |
-| `listen.host` / `listen.port` | admin | 监听地址；只接受具体 IP，拒绝 `0.0.0.0` 一类通配地址（与上游 webserver 规则一致） |
-| `tls.cert` / `tls.key` | admin | 证书和私钥路径；未配置时必须显式设置 `insecureHttp: true`，并在启动时告警 |
-| `timeZone` | admin | 额度自然周期的时区，默认 `Asia/Shanghai` |
+| `listenHost` / `listenPort` | admin | 监听地址；只接受具体 IP，拒绝 `0.0.0.0` 一类通配地址（与上游 webserver 规则一致） |
+| `tlsCertFile` / `tlsKeyFile` | admin | 证书和私钥路径；未配置时必须显式设置 `insecureHttp: true`，并在启动时告警 |
+| `directoryFile` / `usageLogFile` | admin | M1 的员工表 YAML 和用量日志；M2 改为管理界面和本机存储 |
+| `timeZone` | admin | 额度自然周期的时区，默认 `Asia/Shanghai`（M2） |
 | `upstreamBaseURL` | admin | 默认 `https://api.deepseek.com/anthropic` |
 | `upstreamReadTimeoutMs` | admin | 不小于 `600000`，覆盖 DeepSeek 排队时长达 10 分钟的 `: keep-alive` |
-| `adminURL` | employee | 管理端地址，例如 `https://10.0.0.8:8443` |
-| `tokenRef` | employee | 授权码的凭据引用名，例如 `GENYEE_KEYHUB_TOKEN` |
+| `accessCodeRef` | employee | 存放接入码的凭据引用名，默认 `GENYEE_KEYHUB_ACCESS_CODE` |
 
 ### 5.2 员工模式
 
-1. 用 `registerDeepSeekProvider(ctx, 'genyee-keyhub', …)` 注册路由：`baseURL` = `adminURL` + `/anthropic`，`resolveAuth` 返回 `{ 'x-api-key': <授权码> }`，授权码每次请求经 `ctx.credentials.resolve(tokenRef)` 读取。
-2. 模型目录使用上游内置 DeepSeek 目录（已核实：`baseURL` 不是官方源时，上游不跟随 `/models` 在线列表）。
-3. 首次使用：在插件设置页填写管理端地址和授权码，授权码经 `ctx.credentials.set` 写入员工本机凭据库。
-4. 管理端返回"授权码已停用"时，给出明确提示："授权已被管理员停用，请联系管理员"。
+1. 启动时在 `127.0.0.1` 上开一个系统分配的端口作为本机中转，并生成一个本次启动专用的随机密钥；只有携带该密钥的请求才会被转发，本机其他程序无法借用员工的身份。
+2. 用 `registerDeepSeekProvider(ctx, 'genyee-keyhub', …)` 注册路由：`baseURL` 指向本机中转，`resolveAuth` 返回本次启动的密钥。
+3. 本机中转每次请求经 `ctx.credentials.resolve(accessCodeRef)` 读取接入码，换上其中的授权码，经核对证书指纹的 HTTPS 连接转发给管理端。
+4. 模型目录使用上游内置 DeepSeek 目录（已核实：`baseURL` 不是官方源时，上游不跟随 `/models` 在线列表）。
+5. 首次使用：在插件设置页粘贴接入码（M2），写入员工本机凭据库；M1 阶段用同名凭据或环境变量。
+6. 管理端返回"授权码已停用"时，给出明确提示："授权已被管理员停用，请联系管理员"。
 
 ### 5.3 管理员模式
 
@@ -153,7 +156,7 @@
 **模型与并发**：
 
 - 按员工设置可用模型列表；未列出的模型直接拒绝。
-- 按员工设置并发上限：统计该员工同时进行的请求数，超过即拒绝。DeepSeek 对单个 `user_id` 的上限（500 到 2500）对个人过宽，不能替代这一项。
+- 按员工设置并发上限：统计该员工同时进行的请求数，超过即拒绝。已核实官方《限速与隔离》：只有申请过并发扩容的账号，DeepSeek 才按单个 `user_id` 限制并发（`deepseek-flash` 2500、`deepseek-v4-pro` 500）；普通账号所有 `user_id` 合并计算账号并发。公司目前未扩容，一名员工可能占满全公司并发，因此这一项必须由管理端执行。
 
 **账号余额**：
 
@@ -163,18 +166,18 @@
 
 ### M0 技术验证（先做，任何一项不通过都要回来改方向）
 
-| 编号 | 验证项 | 通过标准 |
-|---|---|---|
-| V1 | 桌面端宿主进程内，插件能自行监听内网端口 | 另一台机器能访问 `GET /keyhub/v1/status` |
-| V2 | `registerDeepSeekProvider` 可从树外包调用 | 员工端路由跑通一次带工具调用的多轮对话，`anthropic-beta` 原样到达上游 |
-| V3 | DeepSeek Anthropic 端点接受 `metadata.user_id` | 同一 Key、不同 `user_id` 的并发请求互不挤占单用户并发上限（官方说明页 `api-docs.deepseek.com` 在本会话网络中无法访问，当前以 DSH_ENTERPRISE_PLAN.md §4.10 的摘录为准，必须实测） |
-| V4 | 员工端信任管理端证书的方式 | 上游适配器使用全局 `fetch`，无法按请求固定证书；需确认公司内部 CA 或自签证书的信任途径（系统证书库或 `NODE_EXTRA_CA_CERTS`）在桌面端有效 |
-| V5 | 树外包构建客户端半侧 | 上游的 `clientBundle` 构建预设不在已发布包里，需在我们仓库复刻；管理界面在桌面端能显示 |
-| V6 | 桌面端安装 `.tgz` 插件 | 确认桌面端所用 profile 名称，`dsh plugin add` 后重启生效 |
-| V7 | 上游包已在 npm 发布且版本可对齐 | `@deepseek-ai/dsh-llm-deepseek` 等依赖可按 `0.2.2-alpha.2` 安装 |
-| V8 | 官方账号余额查询接口 | 能用 Key 查到账号余额 |
-| V9 | 管理端返回的拒绝原因能显示给员工 | 员工 DSH 界面原样显示"额度已用完"一类提示，而不是笼统的网络错误 |
-| V10 | 流式响应中的用量字段 | 能从 SSE 中取到输入（缓存命中、未命中）和输出 token，足以按价格表折算金额 |
+| 编号 | 验证项 | 通过标准 | 状态 |
+|---|---|---|---|
+| V1 | 桌面端宿主进程内，插件能自行监听内网端口 | 另一台机器能访问 `GET /keyhub/v1/status` | 待桌面端实测 |
+| V2 | `registerDeepSeekProvider` 可从树外包调用 | 员工端路由跑通一次对话，`anthropic-beta` 原样到达上游 | **通过**（npm 上的 `dsh` CLI 加载本插件跑 headless 任务，见 `pnpm test:e2e`）；带工具调用的多轮对话待真实 API 实测 |
+| V3 | DeepSeek Anthropic 端点接受 `metadata.user_id` | 带 `metadata.user_id` 的请求被正常处理 | 官方文档已确认字段位置为 `metadata.user_id`；待真实 API 实测 |
+| V4 | 员工端信任管理端证书的方式 | 员工无需改系统设置即可安全连接 | **已由设计解决**（D15）；自签证书 + 指纹核对已在 e2e 中验证 |
+| V5 | 树外包构建客户端半侧 | 上游的 `clientBundle` 构建预设不在已发布包里，需在我们仓库复刻；管理界面在桌面端能显示 | 待做（M2） |
+| V6 | 桌面端安装 `.tgz` 插件 | 确认桌面端所用 profile 名称，`dsh plugin add` 后重启生效 | 待桌面端实测；`dsh plugin add` 安装到 headless profile 已验证 |
+| V7 | 上游包已在 npm 发布且版本可对齐 | `@deepseek-ai/dsh-llm-deepseek` 等依赖可按 `0.2.2-alpha.2` 安装 | **通过**（npm `alpha` 标签） |
+| V8 | 官方账号余额查询接口 | 能用 Key 查到账号余额 | 待真实 API 实测 |
+| V9 | 管理端返回的拒绝原因能显示给员工 | 员工 DSH 界面原样显示"额度已用完"一类提示，而不是笼统的网络错误 | 已核实上游把错误响应的 `error.message` 作为报错文本；待桌面端界面实测 |
+| V10 | 流式响应中的用量字段 | 能从 SSE 中取到输入（缓存命中、未命中）和输出 token，足以按价格表折算金额 | 字段名已从上游源码确认（`input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`）；待真实 API 实测 |
 
 ### M1 转发闭环（无界面）
 
@@ -183,7 +186,7 @@
   - 两名员工同时对话，DeepSeek 收到两个不同的 `user_id`
   - 员工请求体中伪造的 `metadata.user_id` 被覆盖
   - 停用员工后，下一次请求返回 401，进行中的流被中断
-  - 抓包确认上游请求中没有 `dsh_plugin_packages` 和 `x-deepseek-harness-user-id`
+  - 上游请求中没有任何 `dsh_` 开头的字段和 `x-deepseek-harness-user-id`
   - 排队 5 分钟以上的请求不被转发层超时切断
 
 ### M2 管理界面、额度与用量

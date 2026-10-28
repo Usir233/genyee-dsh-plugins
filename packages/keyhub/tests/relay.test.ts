@@ -92,6 +92,7 @@ describe('relay', () => {
       model: 'deepseek-flash', max_tokens: 16, messages: [{ role: 'user', content: 'ping' }],
       metadata: { user_id: 'emp_bob', other: 'kept' },
       dsh_plugin_packages: ['secret-plugin'],
+      dsh_session_log: { version: 1, events: [] },
     }, { 'x-deepseek-harness-user-id': 'device-123' })
     expect(response.status).toBe(200)
     expect(response.headers.get('content-type')).toBe('text/event-stream')
@@ -109,6 +110,7 @@ describe('relay', () => {
     const body = JSON.parse(received.body) as Record<string, unknown>
     expect(body.metadata).toEqual({ user_id: 'emp_alice', other: 'kept' })
     expect(body).not.toHaveProperty('dsh_plugin_packages')
+    expect(body).not.toHaveProperty('dsh_session_log')
     expect(body.model).toBe('deepseek-flash')
   })
 

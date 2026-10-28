@@ -1,8 +1,11 @@
 /** Request rewriting applied by the admin relay before a request leaves for DeepSeek. */
 import type { IncomingHttpHeaders, OutgoingHttpHeaders } from 'node:http'
 
-/** Request body field that lists the employee's enabled DSH plugin packages; never forwarded. */
-const PLUGIN_INVENTORY_FIELD = 'dsh_plugin_packages'
+/**
+ * Prefix DSH reserves for its request body extensions, such as `dsh_plugin_packages` (enabled plugin packages)
+ * and `dsh_session_log` (the session's event log); no such field is forwarded.
+ */
+const DSH_EXTENSION_PREFIX = 'dsh_'
 
 /**
  * Request headers dropped before forwarding: hop-by-hop headers, the employee's
@@ -28,7 +31,7 @@ export type BodyRewrite =
 
 /**
  * Bind a Messages request to one employee.
- * Overwrites `metadata.user_id`, keeps the other `metadata` fields, and removes the plugin inventory field.
+ * Overwrites `metadata.user_id`, keeps the other `metadata` fields, and removes every DSH body extension field.
  * @param raw - the request body the employee sent.
  * @param userId - the employee's DeepSeek `user_id`.
  * @returns the rewritten JSON body and its `model`, or the reason the body is not a JSON object.
@@ -43,7 +46,7 @@ export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
     ? body.metadata as Record<string, unknown>
     : {}
   body.metadata = { ...metadata, user_id: userId }
-  delete body[PLUGIN_INVENTORY_FIELD]
+  for (const field of Object.keys(body)) if (field.startsWith(DSH_EXTENSION_PREFIX)) delete body[field]
   return { ok: true, body: Buffer.from(JSON.stringify(body), 'utf8'), model: typeof body.model === 'string' ? body.model : undefined }
 }
 

@@ -33,20 +33,22 @@ dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
    node node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js make-cert --ip 10.0.0.8 --out ~/.genyee-keyhub
    ```
 
-2. 在管理员 profile 的 `cordis.patch.yml` 中把插件行改为管理员模式：
+2. 在管理员 profile 的 `cordis.patch.yml` 末尾**新增**一行管理员模式的插件行。组合包自带的员工行保持不变，管理员自己用 DSH 时也走本机转发，用量记在管理员自己的员工条目下：
 
    ```yaml
-   - id: genyee-keyhub
-     config:
-       role: admin
-       listenHost: 10.0.0.8
-       listenPort: 8443
-       tlsCertFile: /home/admin/.genyee-keyhub/relay.crt
-       tlsKeyFile: /home/admin/.genyee-keyhub/relay.key
-       ledgerFile: /home/admin/.genyee-keyhub/ledger.db
+   - insert:
+       - id: genyee-keyhub-admin
+         name: '@genyee/dsh-keyhub'
+         config:
+           role: admin
+           listenHost: 10.0.0.8
+           listenPort: 8443
+           tlsCertFile: /home/admin/.genyee-keyhub/relay.crt
+           tlsKeyFile: /home/admin/.genyee-keyhub/relay.key
+           ledgerFile: /home/admin/.genyee-keyhub/ledger.db
    ```
 
-   `listenHost` 必须是本机某个网卡的具体 IP，不接受 `0.0.0.0`。不配置证书时必须显式写 `insecureHttp: true`，此时授权码在内网明文传输。
+   `listenHost` 必须是本机某个网卡的具体 IP，不接受 `0.0.0.0`。不配置证书时必须显式写 `insecureHttp: true`，此时授权码在内网明文传输。管理员也用下文的 `employee-add` 给自己建一个员工条目，并按“员工”一节保存自己的接入码。
 
 3. 用命令行工具维护账本（下文 `T` 代表 `node node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js`，`DB` 代表账本路径）。金额单位为元，价格单位为元/百万 token：
 
@@ -70,7 +72,15 @@ dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
 
 ### 员工
 
-把管理员给的接入码存为凭据 `GENYEE_KEYHUB_ACCESS_CODE`（或同名环境变量）。员工端在本机 `127.0.0.1` 上开一个随机端口，DSH 的模型请求经它转发给管理端；连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
+把管理员给的接入码存为凭据 `GENYEE_KEYHUB_ACCESS_CODE`：在 DSH 的凭据文件（macOS `~/.dsh/.credentials.yaml`，Windows `%USERPROFILE%\.dsh\.credentials.yaml`）的 `refs` 下加一行，保存后自动生效；也可以用同名环境变量。
+
+```yaml
+version: 1
+refs:
+  GENYEE_KEYHUB_ACCESS_CODE: gkh1.eyJ1Ijoi…
+```
+
+员工端在本机 `127.0.0.1` 上开一个随机端口，DSH 的模型请求经它转发给管理端；连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
 
 ## 配置
 
@@ -99,5 +109,4 @@ pnpm test:e2e    # 构建后用 npm 上的 dsh CLI 加载本插件，跑一次 h
 ## 已知限制
 
 - Files API 请求会转发，但尚未记录文件归属，员工理论上可以引用同事上传的文件 id。
-- 管理员自己使用 DSH 时还没有走本机转发（方向文档 D9）。
 - 管理界面尚未实现；命令行工具需要管理员电脑上装有 Node.js 24 以上版本。

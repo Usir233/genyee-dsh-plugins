@@ -1,22 +1,23 @@
-/** Admin role: serve the relay over HTTPS (or explicitly plain HTTP) and keep its directory current. */
+/** Admin role: serve the relay over HTTPS (or explicitly plain HTTP) and enforce the ledger. */
 import type { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
-import { appendFile, readFile, unwatchFile, watchFile } from 'node:fs'
-import { readFile as readFileAsync } from 'node:fs/promises'
+import { readFile } from 'node:fs/promises'
 import type { Server } from 'node:http'
 import { createServer } from 'node:http'
 import { createServer as createSecureServer } from 'node:https'
 import { isIP } from 'node:net'
 import { resolve } from 'node:path'
 import type { AdminConfig } from '../config.ts'
-import type { Directory } from './directory.ts'
-import { loadDirectory, parseDirectory } from './directory.ts'
+import { assertTimeZone, requestCostMicros } from './money.ts'
+import { checkRequest } from './quota.ts'
 import type { UsageRecord } from './relay.ts'
 import { createRelay } from './relay.ts'
+import type { LedgerAdmission } from './store.ts'
+import { KeyhubStore } from './store.ts'
 
-/** How often the directory file's modification time is polled. */
-const DIRECTORY_POLL_MS = 1000
+/** How often the ledger is checked for writes made by admin tools. */
+const LEDGER_POLL_MS = 1000
 
 /**
  * Reject wildcard and non-literal listen addresses.
@@ -31,21 +32,42 @@ export function assertConcreteHost(host: string): void {
 }
 
 /**
+ * Cost of one completed request at its completion time.
+ * @param store - the ledger.
+ * @param record - the request's usage record.
+ * @returns micro-yuan; zero when the response reported no usage.
+ */
+function costOf(store: KeyhubStore, record: UsageRecord): number {
+  if (record.usage === undefined || record.model === undefined) return 0
+  const price = store.priceAt(record.model, Date.parse(record.at))
+  return price === undefined ? 0 : requestCostMicros(record.usage, price)
+}
+
+/**
  * Start the admin role.
- * @param ctx - the plugin context owning the listener and the directory watch.
+ * @param ctx - the plugin context owning the ledger, the listener, and the ledger watch.
  * @param config - admin settings.
  */
 export async function applyAdmin(ctx: Context, config: AdminConfig): Promise<void> {
   assertConcreteHost(config.listenHost)
+  assertTimeZone(config.timeZone)
   if (!config.insecureHttp && (config.tlsCertFile === undefined || config.tlsKeyFile === undefined)) {
     throw new Error('keyhub: set tlsCertFile and tlsKeyFile, or set insecureHttp: true to serve plain HTTP')
   }
-  const directoryFile = resolve(config.directoryFile)
-  const usageLogFile = resolve(config.usageLogFile)
-  let directory: Directory = await loadDirectory(directoryFile)
+  const ledgerFile = resolve(config.ledgerFile)
+  let store: KeyhubStore | undefined
+  ctx.effect(() => {
+    const opened = KeyhubStore.open(ledgerFile)
+    store = opened
+    return () => { opened.close() }
+  }, 'keyhub.ledger')
+  const ledger = store!
 
-  const relay = createRelay({
-    directory: () => directory,
+  const relay = createRelay<LedgerAdmission>({
+    admit: token => ledger.admit(token),
+    check: (admission, model, inFlight) => checkRequest(ledger, { admission, model, inFlight, now: Date.now() }, {
+      timeZone: config.timeZone, defaultMaxConcurrency: config.defaultMaxConcurrency,
+    }),
     async resolveKey(ref) {
       const name = credentialRef(ref)
       const credentials = ctx.get('credentials')
@@ -55,41 +77,29 @@ export async function applyAdmin(ctx: Context, config: AdminConfig): Promise<voi
     upstreamBaseURL: config.upstreamBaseURL,
     upstreamReadTimeoutMs: config.upstreamReadTimeoutMs,
     maxRequestBytes: config.maxRequestBytes,
-    recordUsage(record: UsageRecord) {
-      appendFile(usageLogFile, `${JSON.stringify(record)}\n`, (error) => {
-        if (error !== null) ctx.logger.error('keyhub: appending usage to %s failed: %s', usageLogFile, error.message)
-      })
+    recordUsage(record) {
+      try {
+        ledger.recordUsage({ ...record, at: Date.parse(record.at), costMicros: costOf(ledger, record) })
+      } catch (error) {
+        ctx.logger.error('keyhub: recording usage of %s failed: %s', record.userId, error instanceof Error ? error.message : String(error))
+      }
     },
     warn(message) { ctx.logger.warn(message) },
   })
 
   ctx.effect(() => {
-    const reload = (): void => {
-      readFile(directoryFile, 'utf8', (error, source) => {
-        if (error !== null) {
-          ctx.logger.error('keyhub: reading %s failed; keeping the previous directory: %s', directoryFile, error.message)
-          return
-        }
-        let next: Directory
-        try { next = parseDirectory(source, directoryFile) }
-        catch (invalid) {
-          ctx.logger.error('keyhub: %s is invalid; keeping the previous directory: %s', directoryFile, invalid instanceof Error ? invalid.message : String(invalid))
-          return
-        }
-        directory = next
-        relay.interrupt(({ employee }) => {
-          const current = next.byToken.get(employee.tokenSha256)
-          return current !== undefined && current.enabled && current.userId === employee.userId
-            && next.departments.get(current.departmentId)?.enabled === true
-        })
-        ctx.logger.info('keyhub: directory reloaded from %s', directoryFile)
+    let version = ledger.dataVersion()
+    const timer = setInterval(() => {
+      const next = ledger.dataVersion()
+      if (next === version) return
+      version = next
+      relay.interrupt(({ employee, department }) => {
+        const current = ledger.readmit(employee.userId)
+        return current !== undefined && current.employee.tokenSha256 === employee.tokenSha256 && current.department.id === department.id
       })
-    }
-    watchFile(directoryFile, { interval: DIRECTORY_POLL_MS }, (current, previous) => {
-      if (current.mtimeMs !== previous.mtimeMs || current.size !== previous.size) reload()
-    })
-    return () => { unwatchFile(directoryFile) }
-  }, 'keyhub.watchDirectory')
+    }, LEDGER_POLL_MS)
+    return () => { clearInterval(timer) }
+  }, 'keyhub.watchLedger')
 
   await ctx.effect(async () => {
     let server: Server
@@ -97,7 +107,7 @@ export async function applyAdmin(ctx: Context, config: AdminConfig): Promise<voi
       ctx.logger.warn('keyhub: serving plain HTTP on %s; authorization codes cross the network unencrypted', config.listenHost)
       server = createServer((req, res) => { relay.handle(req, res) })
     } else {
-      const [cert, key] = await Promise.all([readFileAsync(resolve(config.tlsCertFile!)), readFileAsync(resolve(config.tlsKeyFile!))])
+      const [cert, key] = await Promise.all([readFile(resolve(config.tlsCertFile!)), readFile(resolve(config.tlsKeyFile!))])
       server = createSecureServer({ cert, key }, (req, res) => { relay.handle(req, res) })
     }
     // Requests may wait in DeepSeek's queue for up to 10 minutes; the upstream timeout bounds them instead.

@@ -1,6 +1,6 @@
 # Genyee 密钥中心（`@genyee/dsh-keyhub`）方向文档
 
-> 状态：方向已定；M1 转发闭环已实现（`dev` 分支），M0 验证进行中，见 §6。
+> 状态：方向已定；M1 转发闭环和 M2 后端（额度、价格、模型与并发限制）已实现于 `dev` 分支，管理界面未做；M0 验证进行中，见 §6。
 > 基线：上游 `@deepseek-ai/dsh-root` `0.2.2-alpha.2`。
 > 关系：本文取代 `Usir233/DSH-GENYEE` 仓库中的 DSH_ENTERPRISE_PLAN.md 的第 5 节（模式 A/B 选型）和第 6 节中与密钥、网关相关的工作流；该文档其余部分作为背景材料保留。
 
@@ -70,7 +70,8 @@
 | `role` | 两者 | `admin` 或 `employee` |
 | `listenHost` / `listenPort` | admin | 监听地址；只接受具体 IP，拒绝 `0.0.0.0` 一类通配地址（与上游 webserver 规则一致） |
 | `tlsCertFile` / `tlsKeyFile` | admin | 证书和私钥路径；未配置时必须显式设置 `insecureHttp: true`，并在启动时告警 |
-| `directoryFile` / `usageLogFile` | admin | M1 的员工表 YAML 和用量日志；M2 改为管理界面和本机存储 |
+| `ledgerFile` | admin | SQLite 账本：部门、员工、价格、额度、追加额度和用量 |
+| `defaultMaxConcurrency` | admin | 员工未单独设置时的并发上限，默认 8 |
 | `timeZone` | admin | 额度自然周期的时区，默认 `Asia/Shanghai`（M2） |
 | `upstreamBaseURL` | admin | 默认 `https://api.deepseek.com/anthropic` |
 | `upstreamReadTimeoutMs` | admin | 不小于 `600000`，覆盖 DeepSeek 排队时长达 10 分钟的 `: keep-alive` |
@@ -108,7 +109,7 @@
 
 - `user_id` 格式 `emp_<随机 16 位 base32>`，创建员工时生成，**不含姓名、工号等明文隐私**，满足官方约束（`[a-zA-Z0-9\-_]+`，最长 512）。员工姓名与 `user_id` 的对照只存在管理端。
 - 授权码 `gk_<256 位随机数的 base64url>`，生成时只显示一次，管理端只存 SHA-256。
-- 部门表、员工表、价格表、用量记录存于管理员本机，经上游存储设施（`ctx.storageDomain` / `storage-sqlite`）持久化。
+- 部门表、员工表、价格表、追加额度和用量记录存于管理员本机的一个 SQLite 文件（Node 自带的 `node:sqlite`，与上游 `storage-sqlite` 使用同一个库），不依赖上游预发布的存储服务接口。账本结构版本记在 `PRAGMA user_version`，只增不减；插件遇到更新版本写入的账本时拒绝启动。
 - 部门的 Key 存于管理员本机凭据库，部门表只保存凭据引用名（例如 `GENYEE_DEEPSEEK_KEY_SALES`），不保存密钥本身。
 
 **管理界面**（插件页面，经 `dsh.client` 客户端半侧挂载）：
@@ -146,7 +147,7 @@
 - 价格表按模型分三项：输入（缓存命中）、输入（缓存未命中）、输出，单位"元 / 百万 token"。价格由管理员维护，插件不内置价格。
 - 每条用量记录按请求完成时生效的价格折算，保存折算结果；之后改价不影响已有记录。
 - 请求使用了价格表中没有的模型时，拒绝该请求并提示管理员补充价格，不按零元放行。
-- 金额以整数存储，单位 0.0001 元，避免小数累加误差。
+- 金额以整数存储，单位 0.000001 元；价格以整数存储，单位 0.0001 元/百万 token。每个请求的费用先精确计算，再四舍五入到 0.000001 元，避免小数累加误差。
 
 **超额处理**：
 

@@ -2,8 +2,8 @@
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import type { Admission, Directory } from './directory.ts'
-import { admit } from './directory.ts'
+import type { Admission } from './directory.ts'
+import type { Refusal } from './quota.ts'
 import { downstreamHeaders, rewriteMessagesBody, upstreamHeaders } from './rewrite.ts'
 import type { TokenUsage, UsageTap } from './usage.ts'
 import { jsonUsageTap, streamUsageTap } from './usage.ts'
@@ -28,9 +28,21 @@ export interface UsageRecord {
 }
 
 /** Facilities the relay handler needs from its host. */
-export interface RelayDependencies {
-  /** The current directory generation. */
-  directory(): Directory
+export interface RelayDependencies<A extends Admission> {
+  /**
+   * Admit one authorization token.
+   * @param token - the presented token.
+   * @returns the employee and department, or `undefined` when the token is unknown or either is disabled.
+   */
+  admit(token: string): A | undefined
+  /**
+   * Decide whether an admitted Messages request may go to DeepSeek; called right before forwarding.
+   * @param admission - the employee and department.
+   * @param model - the request's `model`, if any.
+   * @param inFlight - the employee's other requests in flight.
+   * @returns the refusal, or `undefined` to forward.
+   */
+  check(admission: A, model: string | undefined, inFlight: number): Refusal | undefined
   /**
    * Resolve a department key.
    * @param ref - the department's credential reference.
@@ -45,7 +57,7 @@ export interface RelayDependencies {
    * Persist one usage record; failures are the callee's to report.
    * @param record - the completed request's record.
    */
-  recordUsage(record: UsageRecord): void
+  recordUsage(record: UsageRecord, admission: A): void
   /**
    * Report a contained failure.
    * @param message - diagnostic text without secrets.
@@ -54,7 +66,7 @@ export interface RelayDependencies {
 }
 
 /** A relay request handler with control over in-flight requests. */
-export interface Relay {
+export interface Relay<A extends Admission> {
   /**
    * Serve one HTTP request.
    * @param req - the employee request.
@@ -65,13 +77,13 @@ export interface Relay {
    * Abort every in-flight request whose admission no longer passes.
    * @param stillAdmitted - returns whether a request's employee may continue.
    */
-  interrupt(stillAdmitted: (admission: Admission) => boolean): void
+  interrupt(stillAdmitted: (admission: A) => boolean): void
   /** Abort every in-flight request. */
   closeAll(): void
 }
 
 /** Anthropic error `type` values the DSH DeepSeek adapter classifies. */
-type ErrorType = 'authentication_error' | 'permission_error' | 'invalid_request_error' | 'not_found_error' | 'request_too_large' | 'api_error'
+type ErrorType = Refusal['type'] | 'authentication_error' | 'not_found_error' | 'request_too_large' | 'api_error'
 
 const MESSAGES_PATH = '/anthropic/v1/messages'
 const FILES_PATH = '/anthropic/v1/files'
@@ -123,18 +135,18 @@ function readBody(req: IncomingMessage, limit: number): Promise<Buffer | undefin
  * @param deps - host facilities and upstream settings.
  * @returns the handler and its in-flight request control.
  */
-export function createRelay(deps: RelayDependencies): Relay {
+export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Relay<A> {
   const root = apiRoot(deps.upstreamBaseURL)
-  const inFlight = new Set<{ readonly admission: Admission, abort(): void }>()
+  const inFlight = new Set<{ readonly admission: A, abort(): void }>()
 
-  const authenticate = (req: IncomingMessage, res: ServerResponse): Admission | undefined => {
+  const authenticate = (req: IncomingMessage, res: ServerResponse): A | undefined => {
     const token = req.headers['x-api-key']
-    const admission = typeof token === 'string' && token.length > 0 ? admit(deps.directory(), token) : undefined
+    const admission = typeof token === 'string' && token.length > 0 ? deps.admit(token) : undefined
     if (admission === undefined) replyError(res, 401, 'authentication_error', '授权码无效或已被管理员停用，请联系管理员')
     return admission
   }
 
-  const departmentKey = async (admission: Admission, res: ServerResponse): Promise<string | undefined> => {
+  const departmentKey = async (admission: A, res: ServerResponse): Promise<string | undefined> => {
     let key: string | undefined
     try { key = await deps.resolveKey(admission.department.keyRef) }
     catch (error) {
@@ -152,7 +164,7 @@ export function createRelay(deps: RelayDependencies): Relay {
    * @returns resolves once the exchange ended, with how it ended and the usage observed.
    */
   const forward = (
-    req: IncomingMessage, res: ServerResponse, admission: Admission, target: URL,
+    req: IncomingMessage, res: ServerResponse, admission: A, target: URL,
     headers: OutgoingHttpHeaders, body: Buffer | IncomingMessage, observeUsage: boolean,
   ): Promise<{ outcome: RequestOutcome, status: number | undefined, usage: TokenUsage | undefined }> => new Promise((resolve) => {
     let settled = false
@@ -232,6 +244,12 @@ export function createRelay(deps: RelayDependencies): Relay {
     }
     const key = await departmentKey(admission, res)
     if (key === undefined) return
+    const concurrent = [...inFlight].filter(entry => entry.admission.employee.userId === admission.employee.userId).length
+    const refusal = deps.check(admission, rewrite.model, concurrent)
+    if (refusal !== undefined) {
+      replyError(res, refusal.status, refusal.type, refusal.message)
+      return
+    }
     const target = new URL(`${root}/messages`)
     const result = await forward(req, res, admission, target, upstreamHeaders(req.headers, key, rewrite.body.length), rewrite.body, true)
     if (result.status === undefined && result.usage === undefined && result.outcome === 'failed') return
@@ -244,7 +262,7 @@ export function createRelay(deps: RelayDependencies): Relay {
       outcome: result.outcome,
       usage: result.usage,
       clientAddress: req.socket.remoteAddress,
-    })
+    }, admission)
   }
 
   const files = async (req: IncomingMessage, res: ServerResponse, url: URL): Promise<void> => {

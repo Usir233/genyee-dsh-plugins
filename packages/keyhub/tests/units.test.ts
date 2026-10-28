@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { decodeAccessCode, encodeAccessCode, generateToken, normalizeFingerprint } from '../src/access-code.ts'
-import { admit, hashToken, parseDirectory } from '../src/admin/directory.ts'
+import { assertTimeZone, formatYuan, parsePrice, parseYuan, periodStart, requestCostMicros } from '../src/admin/money.ts'
 import { rewriteMessagesBody } from '../src/admin/rewrite.ts'
 import { jsonUsageTap, streamUsageTap } from '../src/admin/usage.ts'
 
@@ -33,28 +33,55 @@ describe('access codes', () => {
   })
 })
 
-describe('directory', () => {
-  const token = generateToken()
-  const valid = `
-departments:
-  - { id: sales, name: 销售部, keyRef: KEY_SALES }
-employees:
-  - { userId: emp_a, name: A, department: sales, tokenSha256: ${hashToken(token)} }
-`
-
-  it('admits a listed token and defaults entries to enabled', () => {
-    const admission = admit(parseDirectory(valid, 'd.yml'), token)
-    expect(admission?.employee.userId).toBe('emp_a')
-    expect(admission?.department.keyRef).toBe('KEY_SALES')
-    expect(admit(parseDirectory(valid, 'd.yml'), generateToken())).toBeUndefined()
+describe('money', () => {
+  it('rounds one request cost to micro-yuan', () => {
+    const price = { inputCacheHit: parsePrice('0.2'), inputCacheMiss: parsePrice('2'), output: parsePrice('3') }
+    // 1e6 hit × 0.2 + (5e5 + 5e5) miss × 2 + 1e6 out × 3 = 5.2 元
+    expect(requestCostMicros({ cacheReadTokens: 1_000_000, inputTokens: 500_000, cacheWriteTokens: 500_000, outputTokens: 1_000_000 }, price)).toBe(5_200_000)
+    // 1 output token × 3 元/M = 3 micro-yuan; 1 hit × 0.2 = 0.2 → rounds to 0.
+    expect(requestCostMicros({ cacheReadTokens: 0, inputTokens: 0, cacheWriteTokens: 0, outputTokens: 1 }, price)).toBe(3)
+    expect(requestCostMicros({ cacheReadTokens: 1, inputTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }, price)).toBe(0)
+    expect(requestCostMicros({ cacheReadTokens: 3, inputTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }, price)).toBe(1)
   })
 
-  it('names the first invalid entry', () => {
-    expect(() => parseDirectory(valid.replace('department: sales', 'department: hr'), 'd.yml')).toThrow('employees[0].department "hr"')
-    expect(() => parseDirectory(valid.replace('userId: emp_a', 'userId: 张三'), 'd.yml')).toThrow('employees[0].userId must match')
-    expect(() => parseDirectory(valid.replace(hashToken(token), 'abc'), 'd.yml')).toThrow('tokenSha256 must be a hex SHA-256 digest')
-    expect(() => parseDirectory(`${valid}  - { userId: emp_a, name: B, department: sales, tokenSha256: ${hashToken(generateToken())} }\n`, 'd.yml')).toThrow('duplicated')
-    expect(() => parseDirectory('departments: 3', 'd.yml')).toThrow('must be a list')
+  it('parses yuan amounts and prices exactly', () => {
+    expect(parseYuan('100')).toBe(100_000_000)
+    expect(parseYuan('0.000001')).toBe(1)
+    expect(parsePrice('0.2')).toBe(2_000)
+    expect(() => parseYuan('-1')).toThrow('格式不正确')
+    expect(() => parseYuan('1.0000001')).toThrow('格式不正确')
+    expect(() => parsePrice('1.00001')).toThrow('格式不正确')
+  })
+
+  it('formats sub-fen amounts with 4 decimals', () => {
+    expect(formatYuan(1_234_567)).toBe('¥1.23')
+    expect(formatYuan(131)).toBe('¥0.0001')
+    expect(formatYuan(0)).toBe('¥0.00')
+  })
+})
+
+describe('periodStart', () => {
+  // 2026-10-28 (Wednesday) 01:30 in Shanghai = 2026-10-27T17:30Z.
+  const now = Date.parse('2026-10-27T17:30:00Z')
+
+  it('uses the Shanghai calendar, with weeks from Monday', () => {
+    expect(new Date(periodStart('day', now, 'Asia/Shanghai')!).toISOString()).toBe('2026-10-27T16:00:00.000Z')
+    expect(new Date(periodStart('week', now, 'Asia/Shanghai')!).toISOString()).toBe('2026-10-25T16:00:00.000Z')
+    expect(new Date(periodStart('month', now, 'Asia/Shanghai')!).toISOString()).toBe('2026-09-30T16:00:00.000Z')
+    expect(new Date(periodStart('year', now, 'Asia/Shanghai')!).toISOString()).toBe('2025-12-31T16:00:00.000Z')
+    expect(periodStart('total', now, 'Asia/Shanghai')).toBeUndefined()
+  })
+
+  it('handles a Sunday and a zone with daylight saving time', () => {
+    const sunday = Date.parse('2026-11-01T10:00:00Z')
+    expect(new Date(periodStart('week', sunday, 'Asia/Shanghai')!).toISOString()).toBe('2026-10-25T16:00:00.000Z')
+    // New York leaves DST on 2026-11-01; that day's midnight is still EDT (UTC-4).
+    expect(new Date(periodStart('day', Date.parse('2026-11-01T18:00:00Z'), 'America/New_York')!).toISOString()).toBe('2026-11-01T04:00:00.000Z')
+    expect(new Date(periodStart('month', Date.parse('2026-11-15T12:00:00Z'), 'America/New_York')!).toISOString()).toBe('2026-11-01T04:00:00.000Z')
+  })
+
+  it('rejects unknown time zones', () => {
+    expect(() => assertTimeZone('Mars/Base')).toThrow(RangeError)
   })
 })
 

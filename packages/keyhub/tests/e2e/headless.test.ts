@@ -5,7 +5,7 @@
  */
 import { execFile } from 'node:child_process'
 import { X509Certificate } from 'node:crypto'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -13,8 +13,9 @@ import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { generate } from 'selfsigned'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { encodeAccessCode, generateToken, normalizeFingerprint } from '../../src/access-code.ts'
-import { hashToken } from '../../src/admin/directory.ts'
+import { encodeAccessCode, normalizeFingerprint } from '../../src/access-code.ts'
+import { parsePrice } from '../../src/admin/money.ts'
+import { KeyhubStore } from '../../src/admin/store.ts'
 import type { MockDeepSeek } from '../support/mock-deepseek.ts'
 import { startMockDeepSeek, streamReply } from '../support/mock-deepseek.ts'
 
@@ -35,7 +36,6 @@ describe('headless DSH through the relay', () => {
   let work: string
   let upstream: MockDeepSeek
   let env: NodeJS.ProcessEnv
-  const token = generateToken()
 
   beforeAll(async () => {
     home = await mkdtemp(join(tmpdir(), 'keyhub-home-'))
@@ -49,13 +49,11 @@ describe('headless DSH through the relay', () => {
     await writeFile(join(work, 'relay.crt'), pems.cert)
     await writeFile(join(work, 'relay.key'), pems.private)
     const port = await freePort()
-    await writeFile(join(work, 'directory.yml'), [
-      'departments:',
-      '  - { id: rd, name: 研发部, keyRef: GENYEE_KEY_RD }',
-      'employees:',
-      `  - { userId: emp_e2e01, name: 测试员工, department: rd, tokenSha256: ${hashToken(token)} }`,
-      '',
-    ].join('\n'))
+    const store = KeyhubStore.open(join(work, 'ledger.db'))
+    store.putDepartment({ id: 'rd', name: '研发部', keyRef: 'GENYEE_KEY_RD', enabled: true })
+    const token = store.addEmployee({ userId: 'emp_e2e01', name: '测试员工', departmentId: 'rd' })
+    store.setPrice('deepseek-flash', { inputCacheHit: parsePrice('0.2'), inputCacheMiss: parsePrice('2'), output: parsePrice('3') }, 0)
+    store.close()
     await writeFile(join(work, 'admin.patch.yml'), [
       '- insert:',
       '    - id: genyee-keyhub-admin',
@@ -66,8 +64,7 @@ describe('headless DSH through the relay', () => {
       `        listenPort: ${port}`,
       `        tlsCertFile: ${join(work, 'relay.crt')}`,
       `        tlsKeyFile: ${join(work, 'relay.key')}`,
-      `        directoryFile: ${join(work, 'directory.yml')}`,
-      `        usageLogFile: ${join(work, 'usage.jsonl')}`,
+      `        ledgerFile: ${join(work, 'ledger.db')}`,
       `        upstreamBaseURL: ${upstream.baseURL}`,
       '',
     ].join('\n'))
@@ -108,8 +105,11 @@ describe('headless DSH through the relay', () => {
       expect(Object.keys(body).filter(field => field.startsWith('dsh_'))).toEqual([])
     }
 
-    const usage = (await readFile(join(work, 'usage.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
-    expect(usage).toHaveLength(upstream.received.length)
-    expect(usage[0]).toMatchObject({ userId: 'emp_e2e01', departmentId: 'rd', outcome: 'completed', status: 200 })
+    const store = KeyhubStore.open(join(work, 'ledger.db'))
+    try {
+      const [spending] = store.spending('employee', 0, Date.now() + 1)
+      expect(spending).toMatchObject({ id: 'emp_e2e01', requests: upstream.received.length })
+      expect(spending.costMicros).toBeGreaterThan(0)
+    } finally { store.close() }
   })
 })

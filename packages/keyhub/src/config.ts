@@ -14,10 +14,12 @@ export interface AdminConfig {
   tlsKeyFile?: string
   /** Serve plain HTTP; authorization codes then cross the network unencrypted. */
   insecureHttp: boolean
-  /** YAML file listing departments and employees; reloaded when it changes. */
-  directoryFile: string
-  /** JSON Lines file each completed request appends one usage record to. */
-  usageLogFile: string
+  /** SQLite ledger of departments, employees, prices, quotas, and usage; created when missing. */
+  ledgerFile: string
+  /** IANA time zone whose calendar defines quota days, weeks (from Monday), months, and years. */
+  timeZone: string
+  /** Simultaneous requests allowed to an employee without a limit of their own. */
+  defaultMaxConcurrency: number
   /** DeepSeek Anthropic-compatible API root the relay forwards to. */
   upstreamBaseURL: string
   /** Idle read timeout of one upstream response; DeepSeek keeps a queued request alive for up to 10 minutes. */
@@ -46,8 +48,9 @@ const AdminConfigSchema: z<AdminConfig> = z.object({
   tlsCertFile: z.string(),
   tlsKeyFile: z.string(),
   insecureHttp: z.boolean().default(false),
-  directoryFile: z.string().required(),
-  usageLogFile: z.string().required(),
+  ledgerFile: z.string().required(),
+  timeZone: z.string().default('Asia/Shanghai'),
+  defaultMaxConcurrency: z.natural().min(1).default(8),
   upstreamBaseURL: z.string().default('https://api.deepseek.com/anthropic'),
   upstreamReadTimeoutMs: z.natural().min(MIN_UPSTREAM_READ_TIMEOUT_MS).default(MIN_UPSTREAM_READ_TIMEOUT_MS),
   maxRequestBytes: z.natural().min(1).default(64 * 1024 * 1024),

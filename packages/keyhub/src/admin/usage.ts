@@ -38,6 +38,26 @@ function emptyUsage(): TokenUsage {
   return { inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 0 }
 }
 
+/** Usage observed in one response. */
+export interface ObservedUsage {
+  readonly usage: TokenUsage
+  /**
+   * Whether `outputTokens` is an estimate: the stream ended after `message_start` but before the final
+   * `message_delta`, typically because the employee disconnected while DeepSeek was still generating.
+   */
+  readonly estimated: boolean
+}
+
+/**
+ * UTF-8 bytes of streamed output per token assumed when the final usage is missing.
+ * A measured DeepSeek Chinese answer billed one output token per 4.8 bytes; English text runs denser,
+ * so this figure slightly overestimates Chinese output and roughly matches English.
+ */
+export const ESTIMATE_BYTES_PER_OUTPUT_TOKEN = 4
+
+/** Delta fields whose text DeepSeek generated and bills as output. */
+const GENERATED_DELTA_FIELDS = ['text', 'thinking', 'partial_json'] as const
+
 /** Incremental observer of one response body. */
 export interface UsageTap {
   /**
@@ -47,9 +67,9 @@ export interface UsageTap {
   push(chunk: Buffer): void
   /**
    * Finish observation.
-   * @returns the usage the response reported, or `undefined` when it reported none.
+   * @returns the usage the response reported or implied, or `undefined` when it reported none.
    */
-  finish(): TokenUsage | undefined
+  finish(): ObservedUsage | undefined
 }
 
 /**
@@ -58,7 +78,9 @@ export interface UsageTap {
  */
 export function streamUsageTap(): UsageTap {
   const usage = emptyUsage()
-  let reported = false
+  let started = false
+  let final = false
+  let generatedBytes = 0
   const decoder = new TextDecoder()
   const parser = createParser({
     onEvent(event) {
@@ -69,10 +91,16 @@ export function streamUsageTap(): UsageTap {
       const fields = data as Record<string, unknown>
       if (fields.type === 'message_start' && typeof fields.message === 'object' && fields.message !== null) {
         mergeUsage(usage, (fields.message as Record<string, unknown>).usage)
-        reported = true
+        started = true
       } else if (fields.type === 'message_delta' && fields.usage !== undefined) {
         mergeUsage(usage, fields.usage)
-        reported = true
+        final = true
+      } else if (fields.type === 'content_block_delta' && typeof fields.delta === 'object' && fields.delta !== null) {
+        const delta = fields.delta as Record<string, unknown>
+        for (const field of GENERATED_DELTA_FIELDS) {
+          const text = delta[field]
+          if (typeof text === 'string') generatedBytes += Buffer.byteLength(text, 'utf8')
+        }
       }
     },
   })
@@ -80,7 +108,10 @@ export function streamUsageTap(): UsageTap {
     push(chunk) { parser.feed(decoder.decode(chunk, { stream: true })) },
     finish() {
       parser.feed(decoder.decode())
-      return reported ? usage : undefined
+      if (final) return { usage, estimated: false }
+      if (!started) return undefined
+      const estimate = Math.ceil(generatedBytes / ESTIMATE_BYTES_PER_OUTPUT_TOKEN)
+      return { usage: { ...usage, outputTokens: Math.max(usage.outputTokens, estimate) }, estimated: true }
     },
   }
 }
@@ -106,7 +137,7 @@ export function jsonUsageTap(limitBytes: number): UsageTap {
       if (typeof data !== 'object' || data === null || !('usage' in data)) return undefined
       const usage = emptyUsage()
       mergeUsage(usage, data.usage)
-      return usage
+      return { usage, estimated: false }
     },
   }
 }

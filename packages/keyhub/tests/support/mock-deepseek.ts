@@ -79,6 +79,8 @@ export async function startMockDeepSeek(): Promise<MockDeepSeek> {
       const request = { method: req.method, path: req.url, headers: req.headers, body }
       received.push(request)
       await responder(request, res)
+    }).catch((_aborted: unknown) => {
+      // The relay aborted the request mid-body, which tests of its limits do on purpose; nothing reached `received`.
     })
   })
   await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', resolve) })

@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 /**
  * Admin command-line tools for the ledger, usable while the admin DSH runs:
  *
@@ -7,36 +8,27 @@
  *   employee    --db ledger.db --user emp_xxx [--disable | --enable] [--department rd] [--models a,b | --all-models]
  *               [--max-concurrency 4 | --default-concurrency] [--reset-token --relay … --cert …]
  *   quota       --db ledger.db (--employee emp_xxx | --department rd) (--amount 100 --period month | --clear)
- *   top-up      --db ledger.db (--employee emp_xxx | --department rd) --amount 50 [--note 项目加急] [--time-zone Asia/Shanghai]
+ *   top-up      --db ledger.db (--employee emp_xxx | --department rd) --amount 50 [--note 项目加急]
  *   price       --db ledger.db --model deepseek-flash --hit 0.2 --miss 2 --output 3
- *   report      --db ledger.db [--time-zone Asia/Shanghai]
+ *   report      --db ledger.db
+ *   export      --db ledger.db --from 2026-10-01 --to 2026-11-01 [--employee emp_xxx | --department rd] --out usage.csv
  *
- * Amounts are in 元; prices in 元 per million tokens. Access codes are printed once and not stored.
+ * Amounts are in 元; prices in 元 per million tokens; periods and dates follow the time zone the admin relay recorded
+ * in the ledger. Access codes are printed once and not stored.
  */
-import { randomBytes, X509Certificate } from 'node:crypto'
 import { readFile, writeFile } from 'node:fs/promises'
 import { isIP } from 'node:net'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { generate } from 'selfsigned'
-import { encodeAccessCode, normalizeFingerprint } from '../access-code.ts'
-import { formatYuan, parsePrice, parseYuan, periodStart, PRICE_UNITS_PER_YUAN } from '../admin/money.ts'
-import { quotaStanding } from '../admin/quota.ts'
+import { encodeAccessCode } from '../access-code.ts'
+import { certificateFingerprint, describeQuota, newUserId, quotaView, topUp, usageCsv } from '../admin/ledger-ops.ts'
+import { formatYuan, parsePrice, parseYuan, periodStart, PRICE_UNITS_PER_YUAN, zonedDayStart } from '../admin/money.ts'
 import type { QuotaScope } from '../admin/store.ts'
 import { KeyhubStore } from '../admin/store.ts'
 
 /** Validity of a generated relay certificate. */
 const CERT_VALIDITY_DAYS = 3650
-const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567'
-const DEFAULT_TIME_ZONE = 'Asia/Shanghai'
-
-/**
- * Create a random DeepSeek `user_id` without personal data.
- * @returns `emp_` followed by 16 base32 characters.
- */
-export function newUserId(): string {
-  return `emp_${[...randomBytes(16)].map(byte => BASE32[byte % 32]).join('')}`
-}
 
 function required(value: string | undefined, flag: string): string {
   if (value === undefined || value.length === 0) throw new Error(`missing --${flag}`)
@@ -52,7 +44,7 @@ function withStore<T>(db: string | undefined, run: (store: KeyhubStore) => T): T
 async function accessCodeFor(relay: string | undefined, cert: string | undefined, token: string): Promise<string> {
   const relayURL = new URL(required(relay, 'relay')).origin
   let fingerprint: string | undefined
-  if (relayURL.startsWith('https:')) fingerprint = normalizeFingerprint(new X509Certificate(await readFile(required(cert, 'cert'))).fingerprint256)
+  if (relayURL.startsWith('https:')) fingerprint = certificateFingerprint(await readFile(required(cert, 'cert')))
   return encodeAccessCode({ relayURL, fingerprint, token })
 }
 
@@ -75,7 +67,7 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
     await writeFile(join(out, 'relay.crt'), pems.cert)
     await writeFile(join(out, 'relay.key'), pems.private, { mode: 0o600 })
     console.log(`certificate: ${join(out, 'relay.crt')}\nprivate key: ${join(out, 'relay.key')}`)
-    console.log(`fingerprint: ${normalizeFingerprint(new X509Certificate(pems.cert).fingerprint256)}`)
+    console.log(`fingerprint: ${certificateFingerprint(pems.cert)}`)
   },
 
   async department(args) {
@@ -134,13 +126,10 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   },
 
   async 'top-up'(args) {
-    const { values } = parseArgs({ args, options: { db: { type: 'string' }, employee: { type: 'string' }, department: { type: 'string' }, amount: { type: 'string' }, note: { type: 'string' }, 'time-zone': { type: 'string' } } })
+    const { values } = parseArgs({ args, options: { db: { type: 'string' }, employee: { type: 'string' }, department: { type: 'string' }, amount: { type: 'string' }, note: { type: 'string' } } })
     const [scope, id] = subjectOf(values)
     withStore(values.db, (store) => {
-      const subject = scope === 'employee' ? store.employee(id) : store.department(id)
-      if (subject?.quota === undefined) throw new Error(`${scope} ${id} has no quota to top up`)
-      const now = Date.now()
-      store.addTopUp(scope, id, parseYuan(required(values.amount, 'amount')), periodStart(subject.quota.period, now, values['time-zone'] ?? DEFAULT_TIME_ZONE), values.note, now)
+      topUp(store, scope, id, parseYuan(required(values.amount, 'amount')), values.note, Date.now())
     })
     console.log(`top-up of ${scope} ${id} saved`)
   },
@@ -158,15 +147,11 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
   },
 
   async report(args) {
-    const { values } = parseArgs({ args, options: { db: { type: 'string' }, 'time-zone': { type: 'string' } } })
-    const timeZone = values['time-zone'] ?? DEFAULT_TIME_ZONE
+    const { values } = parseArgs({ args, options: { db: { type: 'string' } } })
     withStore(values.db, (store) => {
       const now = Date.now()
-      const describe = (scope: QuotaScope, id: string, quota: Parameters<typeof quotaStanding>[3] | undefined): string => {
-        if (quota === undefined) return '不限额'
-        const standing = quotaStanding(store, scope, id, quota, now, timeZone)
-        return `${quota.period}: 已用 ${formatYuan(standing.spentMicros)} / ${formatYuan(standing.allowanceMicros)}`
-      }
+      const timeZone = store.timeZone()
+      const describe = (scope: QuotaScope, id: string, quota: Parameters<typeof quotaView>[3]): string => describeQuota(quotaView(store, scope, id, quota, now))
       console.log('# 价格（元/百万 token：命中 / 未命中 / 输出）')
       for (const { model, price } of store.prices(now)) {
         console.log(`  ${model}: ${price.inputCacheHit / PRICE_UNITS_PER_YUAN} / ${price.inputCacheMiss / PRICE_UNITS_PER_YUAN} / ${price.output / PRICE_UNITS_PER_YUAN}`)
@@ -184,6 +169,34 @@ const commands: Record<string, (args: string[]) => Promise<void>> = {
       }
     })
   },
+
+  async export(args) {
+    const { values } = parseArgs({ args, options: { db: { type: 'string' }, from: { type: 'string' }, to: { type: 'string' }, employee: { type: 'string' }, department: { type: 'string' }, out: { type: 'string' } } })
+    const out = required(values.out, 'out')
+    const csv = withStore(values.db, (store) => {
+      const timeZone = store.timeZone()
+      return usageCsv(store, {
+        from: dateStart(required(values.from, 'from'), timeZone),
+        to: dateStart(required(values.to, 'to'), timeZone),
+        ...values.employee === undefined ? {} : { userId: values.employee },
+        ...values.department === undefined ? {} : { departmentId: values.department },
+      })
+    })
+    await writeFile(out, csv)
+    console.log(`usage written to ${out}`)
+  },
+}
+
+/**
+ * Midnight of a calendar date on the ledger's calendar.
+ * @param date - `YYYY-MM-DD`.
+ * @param timeZone - the ledger time zone.
+ * @returns epoch milliseconds.
+ */
+function dateStart(date: string, timeZone: string): number {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(date)
+  if (match === null) throw new Error(`date "${date}" must be YYYY-MM-DD`)
+  return zonedDayStart(Number(match[1]), Number(match[2]), Number(match[3]), timeZone)
 }
 
 const [command, ...rest] = process.argv.slice(2)

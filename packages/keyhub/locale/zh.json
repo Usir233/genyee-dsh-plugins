@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Genyee 密钥中心",
+    "description": "管理员集中保管公司 DeepSeek Key，按员工转发请求、写入 user_id、执行金额额度；员工只持有可吊销的接入码"
+  }
+}

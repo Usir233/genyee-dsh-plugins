@@ -87,7 +87,8 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
     let code: AccessCode
     try { code = await deps.accessCode() }
     catch (error) {
-      replyError(res, 401, 'authentication_error', error instanceof Error ? error.message : String(error))
+      // 400, not 401: DSH shows its own "API key invalid" text for 401 instead of this message.
+      replyError(res, 400, 'invalid_request_error', error instanceof Error ? error.message : String(error))
       return
     }
     const headers: OutgoingHttpHeaders = {}
@@ -101,7 +102,7 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
     })
     open.add(upstream)
     upstream.setTimeout(deps.readTimeoutMs, () => { upstream.destroy(new Error(`no data from the admin relay for ${deps.readTimeoutMs} ms`)) })
-    upstream.once('error', (error) => {
+    upstream.on('error', (error) => {
       const message = error instanceof FingerprintMismatchError
         ? `管理端 ${code.relayURL} 的证书与接入码不符，已拒绝连接；请向管理员确认接入码`
         : `无法连接管理端 ${code.relayURL}：${error.message}；请确认管理员的 DSH 已打开`
@@ -115,7 +116,7 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
       res.writeHead(answer.statusCode ?? 502, forwarded)
       res.flushHeaders()
       answer.pipe(res)
-      answer.once('error', () => { res.destroy() })
+      answer.on('error', () => { res.destroy() })
     })
     upstream.once('close', () => { open.delete(upstream) })
     res.once('close', () => { if (!res.writableFinished) upstream.destroy() })

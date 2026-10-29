@@ -67,7 +67,7 @@ describe('local proxy', () => {
   it('shows the access-code problem to the employee', async () => {
     await withProxy(async () => { throw new Error('尚未填写 Genyee 接入码') }, async (baseURL, secret) => {
       const response = await fetch(`${baseURL}/v1/messages`, { method: 'POST', headers: { 'x-api-key': secret }, body: '{}' })
-      expect(response.status).toBe(401)
+      expect(response.status).toBe(400)
       expect(await response.json()).toMatchObject({ error: { message: '尚未填写 Genyee 接入码' } })
     })
   })

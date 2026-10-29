@@ -61,7 +61,9 @@ export function parseYuan(text: string): number {
 export function parsePrice(text: string): number {
   const match = /^(\d+)(?:\.(\d{1,4}))?$/u.exec(text.trim())
   if (match === null) throw new Error(`价格 "${text}" 格式不正确：应为非负数，最多 4 位小数（元/百万 token）`)
-  return Number(match[1]) * PRICE_UNITS_PER_YUAN + Number((match[2] ?? '').padEnd(4, '0'))
+  const units = Number(match[1]) * PRICE_UNITS_PER_YUAN + Number((match[2] ?? '').padEnd(4, '0'))
+  if (!Number.isSafeInteger(units)) throw new Error(`价格 "${text}" 过大`)
+  return units
 }
 
 /**
@@ -115,6 +117,18 @@ function zonedMidnight(year: number, month: number, day: number, format: Intl.Da
   // A second pass settles dates whose offset differs from the naive guess's (DST transitions).
   at = naive - offsetAt(at, format)
   return at
+}
+
+/**
+ * Midnight of a calendar date in a time zone.
+ * @param year - the year.
+ * @param month - 1 to 12.
+ * @param day - day of month.
+ * @param timeZone - IANA time zone.
+ * @returns epoch milliseconds.
+ */
+export function zonedDayStart(year: number, month: number, day: number, timeZone: string): number {
+  return zonedMidnight(year, month, day, formatter(timeZone))
 }
 
 /**

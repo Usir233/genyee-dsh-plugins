@@ -6,14 +6,17 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { generateToken } from '../src/access-code.ts'
-import { parsePrice, parseYuan, periodStart, requestCostMicros } from '../src/admin/money.ts'
-import { checkRequest } from '../src/admin/quota.ts'
-import type { Relay, UsageRecord } from '../src/admin/relay.ts'
-import { apiRoot, createRelay } from '../src/admin/relay.ts'
-import type { LedgerAdmission } from '../src/admin/store.ts'
+import { topUp } from '../src/admin/ledger-ops.ts'
+import { createLedgerRelay } from '../src/admin/ledger-relay.ts'
+import { parsePrice, parseYuan } from '../src/admin/money.ts'
+import type { Relay } from '../src/admin/relay.ts'
+import { apiRoot } from '../src/admin/relay.ts'
+import type { LedgerAdmission, UsageRow } from '../src/admin/store.ts'
 import { KeyhubStore } from '../src/admin/store.ts'
+import { ESTIMATE_BYTES_PER_OUTPUT_TOKEN } from '../src/admin/usage.ts'
+import { PLUGIN_VERSION } from '../src/version.ts'
 import type { MockDeepSeek } from './support/mock-deepseek.ts'
-import { REPLY_USAGE, sseEvent, startMockDeepSeek } from './support/mock-deepseek.ts'
+import { REPLY_USAGE, sseEvent, startMockDeepSeek, streamReply } from './support/mock-deepseek.ts'
 
 const FLASH = 'deepseek-flash'
 const PRO = 'deepseek-v4-pro'
@@ -22,7 +25,8 @@ interface Harness {
   readonly url: string
   readonly relay: Relay<LedgerAdmission>
   readonly store: KeyhubStore
-  readonly usage: UsageRecord[]
+  /** Usage rows recorded so far, oldest first. */
+  usage(): UsageRow[]
   readonly alice: string
   readonly bob: string
   /** Re-check in-flight requests against the ledger, as the admin role does on ledger writes. */
@@ -39,20 +43,14 @@ async function startRelay(upstream: MockDeepSeek, keys: Record<string, string> =
   const bob = store.addEmployee({ userId: 'emp_bob', name: 'Bob', departmentId: 'rd' })
   store.setPrice(FLASH, { inputCacheHit: parsePrice('0.2'), inputCacheMiss: parsePrice('2'), output: parsePrice('3') }, 0)
   store.setPrice(PRO, { inputCacheHit: parsePrice('1'), inputCacheMiss: parsePrice('4'), output: parsePrice('16') }, 0)
-  const usage: UsageRecord[] = []
-  const relay = createRelay<LedgerAdmission>({
-    admit: token => store.admit(token),
-    check: (admission, model, inFlight) => checkRequest(store, { admission, model, inFlight, now: Date.now() }, { timeZone: 'Asia/Shanghai', defaultMaxConcurrency: 2 }),
+  store.setTimeZone('Asia/Shanghai')
+  const { relay, recheck } = createLedgerRelay(store, {
+    timeZone: 'Asia/Shanghai',
+    defaultMaxConcurrency: 2,
     resolveKey: async ref => keys[ref],
     upstreamBaseURL: upstream.baseURL,
     upstreamReadTimeoutMs: 600_000,
     maxRequestBytes: 1024 * 1024,
-    recordUsage(record) {
-      usage.push(record)
-      const price = record.model === undefined ? undefined : store.priceAt(record.model, Date.parse(record.at))
-      const costMicros = record.usage === undefined || price === undefined ? 0 : requestCostMicros(record.usage, price)
-      store.recordUsage({ ...record, at: Date.parse(record.at), costMicros })
-    },
     warn: () => {},
   })
   const server: Server = createServer((req, res) => { relay.handle(req, res) })
@@ -60,10 +58,9 @@ async function startRelay(upstream: MockDeepSeek, keys: Record<string, string> =
   const { port } = server.address() as AddressInfo
   return {
     url: `http://127.0.0.1:${port}`,
-    relay, store, usage, alice, bob,
-    sync() {
-      relay.interrupt(({ employee }) => store.readmit(employee.userId)?.employee.tokenSha256 === employee.tokenSha256)
-    },
+    relay, store, alice, bob,
+    usage: () => store.usageRows({ from: 0, to: Number.MAX_SAFE_INTEGER }),
+    sync: recheck,
     async close() {
       relay.closeAll()
       const closed = new Promise<void>((resolve) => { server.close(() => { resolve() }) })
@@ -130,10 +127,11 @@ describe('relay', () => {
 
   it('records usage and its cost in the ledger', async () => {
     await (await messages(harness.url, harness.bob, { model: PRO, messages: [] })).text()
-    await waitFor(() => harness.usage.length === 1)
-    expect(harness.usage[0]).toMatchObject({
-      userId: 'emp_bob', departmentId: 'rd', model: PRO, status: 200, outcome: 'completed',
-      usage: { inputTokens: REPLY_USAGE.input_tokens, cacheReadTokens: REPLY_USAGE.cache_read_input_tokens, cacheWriteTokens: 0, outputTokens: REPLY_USAGE.output_tokens },
+    await waitFor(() => harness.usage().length === 1)
+    expect(harness.usage()[0]).toMatchObject({
+      userId: 'emp_bob', departmentId: 'rd', model: PRO, status: 200, outcome: 'completed', estimated: false,
+      inputTokens: REPLY_USAGE.input_tokens, cacheReadTokens: REPLY_USAGE.cache_read_input_tokens, cacheWriteTokens: 0, outputTokens: REPLY_USAGE.output_tokens,
+      costMicros: 131,
     })
     expect(upstream.received[0].headers['x-api-key']).toBe('sk-rd')
     // 7 hit × 1 + 11 miss × 4 + 5 out × 16 = 131 元 per million tokens, i.e. 131 micro-yuan.
@@ -143,32 +141,32 @@ describe('relay', () => {
 
   it('refuses unknown tokens without contacting DeepSeek', async () => {
     const response = await messages(harness.url, generateToken(), { model: FLASH, messages: [] })
-    expect(response.status).toBe(401)
-    expect(await response.json()).toMatchObject({ type: 'error', error: { type: 'authentication_error' } })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ type: 'error', error: { type: 'invalid_request_error', code: 'keyhub_unauthorized', message: '授权码无效或已被管理员停用，请联系管理员' } })
     expect(upstream.received).toHaveLength(0)
   })
 
   it('refuses disabled employees and employees of disabled departments', async () => {
     harness.store.updateEmployee('emp_alice', { enabled: false })
-    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(401)
+    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(400)
     harness.store.updateEmployee('emp_alice', { enabled: true })
     harness.store.putDepartment({ id: 'sales', name: '销售部', keyRef: 'KEY_SALES', enabled: false })
-    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(401)
+    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(400)
     expect((await messages(harness.url, harness.bob, { model: FLASH, messages: [] })).status).toBe(200)
     expect(upstream.received).toHaveLength(1)
   })
 
   it('stops accepting a reset token at once', async () => {
     harness.store.resetToken('emp_alice')
-    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(401)
+    expect((await messages(harness.url, harness.alice, { model: FLASH, messages: [] })).status).toBe(400)
   })
 
-  it('answers a missing department key with a permission error', async () => {
+  it('answers a missing department key with a message for the employee', async () => {
     await harness.close()
     harness = await startRelay(upstream, { KEY_RD: 'sk-rd' })
     const response = await messages(harness.url, harness.alice, { model: FLASH, messages: [] })
-    expect(response.status).toBe(403)
-    expect(await response.json()).toMatchObject({ error: { type: 'permission_error' } })
+    expect(response.status).toBe(400)
+    expect(await response.json()).toMatchObject({ error: { code: 'keyhub_department_key_missing' } })
     expect(upstream.received).toHaveLength(0)
   })
 
@@ -186,8 +184,8 @@ describe('relay', () => {
   it('refuses models outside the employee allowlist and models without a price', async () => {
     harness.store.updateEmployee('emp_alice', { models: [FLASH] })
     const forbidden = await messages(harness.url, harness.alice, { model: PRO, messages: [] })
-    expect(forbidden.status).toBe(403)
-    expect(await forbidden.json()).toMatchObject({ error: { message: `你没有使用模型 ${PRO} 的权限，请联系管理员` } })
+    expect(forbidden.status).toBe(400)
+    expect(await forbidden.json()).toMatchObject({ error: { code: 'keyhub_model_not_allowed', message: `你没有使用模型 ${PRO} 的权限，请联系管理员` } })
     const unpriced = await messages(harness.url, harness.bob, { model: 'deepseek-new', messages: [] })
     expect(unpriced.status).toBe(400)
     expect(await unpriced.json()).toMatchObject({ error: { message: expect.stringContaining('尚未设置模型 deepseek-new 的价格') } })
@@ -212,21 +210,20 @@ describe('relay', () => {
   it('refuses requests once the employee quota is spent, and resumes after a top-up', async () => {
     harness.store.setQuota('employee', 'emp_bob', { micros: 100, period: 'month' }, 0)
     await (await messages(harness.url, harness.bob, { model: PRO, messages: [] })).text()
-    await waitFor(() => harness.usage.length === 1)
+    await waitFor(() => harness.usage().length === 1)
     const refused = await messages(harness.url, harness.bob, { model: PRO, messages: [] })
-    expect(refused.status).toBe(402)
-    expect(await refused.json()).toMatchObject({ error: { type: 'billing_error', message: '你的本月额度已用完（已用 ¥0.0001，额度 ¥0.0001），请联系管理员' } })
-    const now = Date.now()
-    harness.store.addTopUp('employee', 'emp_bob', parseYuan('1'), periodStart('month', now, 'Asia/Shanghai'), undefined, now)
+    expect(refused.status).toBe(400)
+    expect(await refused.json()).toMatchObject({ error: { code: 'keyhub_quota_exhausted', message: '你的本月额度已用完（已用 ¥0.0001，额度 ¥0.0001），请联系管理员' } })
+    topUp(harness.store, 'employee', 'emp_bob', parseYuan('1'), undefined, Date.now())
     expect((await messages(harness.url, harness.bob, { model: PRO, messages: [] })).status).toBe(200)
   })
 
   it('refuses requests once the department quota is spent', async () => {
     harness.store.setQuota('department', 'rd', { micros: 1, period: 'total' }, 0)
     await (await messages(harness.url, harness.bob, { model: FLASH, messages: [] })).text()
-    await waitFor(() => harness.usage.length === 1)
+    await waitFor(() => harness.usage().length === 1)
     const refused = await messages(harness.url, harness.bob, { model: FLASH, messages: [] })
-    expect(refused.status).toBe(402)
+    expect(refused.status).toBe(400)
     expect(await refused.json()).toMatchObject({ error: { message: expect.stringContaining('部门“研发部”的总额度已用完') } })
   })
 
@@ -241,8 +238,8 @@ describe('relay', () => {
     harness.store.updateEmployee('emp_alice', { enabled: false })
     harness.sync()
     await expect(async () => { while (!(await reader.read()).done) { /* drain */ } }).rejects.toThrow()
-    await waitFor(() => harness.usage.length === 1)
-    expect(harness.usage[0]).toMatchObject({ outcome: 'interrupted', usage: { inputTokens: 3 } })
+    await waitFor(() => harness.usage().length === 1)
+    expect(harness.usage()[0]).toMatchObject({ outcome: 'interrupted', inputTokens: 3, estimated: true })
   })
 
   it('aborts the upstream request when the employee disconnects', async () => {
@@ -255,8 +252,8 @@ describe('relay', () => {
     const response = await messages(harness.url, harness.alice, { model: FLASH, messages: [] })
     await response.body!.cancel()
     await waitFor(() => upstreamClosed)
-    await waitFor(() => harness.usage.length === 1)
-    expect(harness.usage[0].outcome).toBe('interrupted')
+    await waitFor(() => harness.usage().length === 1)
+    expect(harness.usage()[0].outcome).toBe('interrupted')
   })
 
   it('passes DeepSeek errors through unchanged', async () => {
@@ -269,21 +266,123 @@ describe('relay', () => {
     expect(await response.json()).toMatchObject({ error: { message: 'busy' } })
   })
 
-  it('forwards Files API requests with the department key', async () => {
+  it('forwards Files API uploads with the department key and records the uploader', async () => {
     upstream.respond((request, res) => {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ id: 'file_1', echoed: request.body.length }))
     })
-    const response = await fetch(`${harness.url}/anthropic/v1/files?limit=5`, { method: 'POST', headers: { 'x-api-key': harness.alice }, body: 'file-bytes' })
+    const response = await fetch(`${harness.url}/anthropic/v1/files`, { method: 'POST', headers: { 'x-api-key': harness.alice }, body: 'file-bytes' })
     expect(response.status).toBe(200)
-    expect(upstream.received[0]).toMatchObject({ method: 'POST', path: '/anthropic/v1/files?limit=5', body: 'file-bytes' })
+    expect(await response.json()).toEqual({ id: 'file_1', echoed: 10 })
+    expect(upstream.received[0]).toMatchObject({ method: 'POST', path: '/anthropic/v1/files', body: 'file-bytes' })
     expect(upstream.received[0].headers['x-api-key']).toBe('sk-sales')
-    expect(harness.usage).toHaveLength(0)
+    expect(harness.store.fileOwner('file_1')).toBe('emp_alice')
+    expect(harness.usage()).toHaveLength(0)
   })
 
-  it('reports the employee on the status route', async () => {
+  it('keeps each employee to their own files', async () => {
+    harness.store.recordFile('file_alice', 'emp_alice', 'sales', 0)
+    harness.store.recordFile('file_bob', 'emp_bob', 'rd', 0)
+    upstream.respond((request, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      if (request.path?.startsWith('/anthropic/v1/files?')) {
+        res.end(JSON.stringify({ data: [{ id: 'file_alice' }, { id: 'file_bob' }, { id: 'file_foreign' }], has_more: true, first_id: 'file_alice', last_id: 'file_foreign' }))
+      } else {
+        res.end(JSON.stringify({ id: 'file_alice', deleted: true }))
+      }
+    })
+    const list = await fetch(`${harness.url}/anthropic/v1/files?limit=1000`, { headers: { 'x-api-key': harness.alice } })
+    expect(await list.json()).toEqual({ data: [{ id: 'file_alice' }], has_more: true, first_id: 'file_alice', last_id: 'file_foreign' })
+
+    const foreign = await fetch(`${harness.url}/anthropic/v1/files/file_bob`, { method: 'DELETE', headers: { 'x-api-key': harness.alice } })
+    expect(foreign.status).toBe(404)
+    const unknown = await fetch(`${harness.url}/anthropic/v1/files/file_foreign`, { headers: { 'x-api-key': harness.alice } })
+    expect(unknown.status).toBe(404)
+    expect(upstream.received).toHaveLength(1)
+
+    const own = await fetch(`${harness.url}/anthropic/v1/files/file_alice`, { method: 'DELETE', headers: { 'x-api-key': harness.alice } })
+    expect(own.status).toBe(200)
+    await own.text()
+    expect(upstream.received[1]).toMatchObject({ method: 'DELETE', path: '/anthropic/v1/files/file_alice' })
+    expect(harness.store.fileOwner('file_alice')).toBeUndefined()
+  })
+
+  it('refuses file uploads above the size limit even without a declared length', async () => {
+    const chunk = new Uint8Array(256 * 1024)
+    let sent = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent >= 8) controller.close()
+        else {
+          sent++
+          controller.enqueue(chunk)
+        }
+      },
+    })
+    const response = await fetch(`${harness.url}/anthropic/v1/files`, { method: 'POST', headers: { 'x-api-key': harness.alice }, body, duplex: 'half' } as RequestInit)
+    expect(response.status).toBe(413)
+    expect(harness.store.fileOwner('file_1')).toBeUndefined()
+  })
+
+  it('refuses file uploads once the quota is spent, but still lets the employee list files', async () => {
+    harness.store.setQuota('employee', 'emp_alice', { micros: 0, period: 'month' }, 0)
+    const upload = await fetch(`${harness.url}/anthropic/v1/files`, { method: 'POST', headers: { 'x-api-key': harness.alice }, body: 'x' })
+    expect(upload.status).toBe(400)
+    upstream.respond((_request, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ data: [], has_more: false }))
+    })
+    expect((await fetch(`${harness.url}/anthropic/v1/files`, { headers: { 'x-api-key': harness.alice } })).status).toBe(200)
+  })
+
+  it('reports the employee standing on the status route', async () => {
+    harness.store.setQuota('employee', 'emp_bob', { micros: parseYuan('10'), period: 'month' }, 0)
+    harness.store.updateEmployee('emp_bob', { models: [PRO, 'deepseek-unpriced'] })
     const response = await fetch(`${harness.url}/keyhub/v1/status`, { headers: { 'x-api-key': harness.bob } })
-    expect(await response.json()).toEqual({ employee: 'Bob', department: '研发部' })
+    expect(await response.json()).toEqual({
+      employee: 'Bob', userId: 'emp_bob', department: '研发部', models: [PRO], maxConcurrency: 2,
+      quota: { employee: { period: 'month', quotaMicros: 10_000_000, allowanceMicros: 10_000_000, spentMicros: 0, remainingMicros: 10_000_000 } },
+      relayVersion: PLUGIN_VERSION,
+    })
+  })
+
+  it('counts the cost reserved by requests in flight against the quota', async () => {
+    // One FLASH request reserves at least its max_tokens of output: 1 000 000 tokens × ¥3 per million = ¥3.
+    harness.store.setQuota('employee', 'emp_alice', { micros: parseYuan('2'), period: 'month' }, 0)
+    upstream.respond((_request, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(': keep-alive\n\n')
+    })
+    const first = await messages(harness.url, harness.alice, { model: FLASH, max_tokens: 1_000_000, messages: [] })
+    expect(first.status).toBe(200)
+    const second = await messages(harness.url, harness.alice, { model: FLASH, max_tokens: 16, messages: [] })
+    expect(second.status).toBe(400)
+    expect(await second.json()).toMatchObject({ error: { message: expect.stringContaining('已被进行中的请求占满') } })
+    await first.body!.cancel()
+    await waitFor(() => harness.usage().length === 1)
+    upstream.respond((_request, res) => { streamReply(res, 'pong') })
+    expect((await messages(harness.url, harness.alice, { model: FLASH, max_tokens: 16, messages: [] })).status).toBe(200)
+  })
+
+  it('bills generated output when the employee disconnects before the final usage', async () => {
+    const text = '长城是中国古代的军事防御工程'
+    upstream.respond((_request, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      sseEvent(res, 'message_start', { type: 'message_start', message: { usage: { input_tokens: 20, cache_read_input_tokens: 0, output_tokens: 0 } } })
+      sseEvent(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'plan' } })
+      sseEvent(res, 'content_block_delta', { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text } })
+    })
+    const response = await messages(harness.url, harness.alice, { model: FLASH, messages: [] })
+    const reader = response.body!.getReader()
+    let seen = ''
+    while (!seen.includes('text_delta')) seen += new TextDecoder().decode((await reader.read()).value)
+    await reader.cancel()
+    await waitFor(() => harness.usage().length === 1)
+    const [row] = harness.usage()
+    const expectedOutput = Math.ceil((Buffer.byteLength('plan') + Buffer.byteLength(text)) / ESTIMATE_BYTES_PER_OUTPUT_TOKEN)
+    expect(row).toMatchObject({ outcome: 'interrupted', estimated: true, inputTokens: 20, outputTokens: expectedOutput })
+    // 20 miss × 2 + output × 3, in 元 per million tokens = micro-yuan.
+    expect(row!.costMicros).toBe(20 * 2 + expectedOutput * 3)
   })
 
   it('streams events to the employee before the upstream response ends', async () => {

@@ -1,6 +1,6 @@
 # Genyee 密钥中心（`@genyee/dsh-keyhub`）方向文档
 
-> 状态：方向已定；M1 转发闭环和 M2 后端（额度、价格、模型与并发限制）已实现于 `dev` 分支，管理界面未做；M0 验证进行中，见 §6。
+> 状态：M1 转发闭环、M2（管理界面、额度、价格、模型与并发限制、用量导出、账号余额、Files 归属）已在 `dev` 分支实现，版本 0.2.0。M0 除跨机器项外均已通过（2026-10-29，真实 DeepSeek API + 本机两个 DSH Web 实例），见 §6。
 > 基线：上游 `@deepseek-ai/dsh-root` `0.2.2-alpha.2`。
 > 关系：本文取代 `Usir233/DSH-GENYEE` 仓库中的 DSH_ENTERPRISE_PLAN.md 的第 5 节（模式 A/B 选型）和第 6 节中与密钥、网关相关的工作流；该文档其余部分作为背景材料保留。
 
@@ -29,6 +29,8 @@
 | D13 | 额度按**金额**计，分**部门**和**员工**两级，请求须两级都有余额才放行；另按员工限制可用模型和并发数（§5.4） | 管理端是唯一出口，员工无法绕过；金额比 token 更贴近财务预算 | 只按 token 计；只设员工一级 |
 | D14 | 不再维护 fork 仓库 `DSH-GENYEE` 的同步；跟进上游的方式是用上游新版本测试插件，通过后更新 `engines.dsh` 并发布插件新版本 | 插件依赖上游已发布的 npm 包、运行在官方 DSH 中，交付不需要 fork | 定期同步 fork |
 | D15 | 公司没有内部 CA：管理端使用自签证书；管理员发给员工的是**接入码**（管理端地址 + 证书 SHA-256 指纹 + 授权码）；员工端本机中转只接受指纹相符的证书，握手核对通过前不发送任何请求字节 | 员工无需安装证书或修改系统设置，Windows、macOS 相同；冒充管理端拿不到授权码 | 员工电脑安装证书；明文 HTTP |
+| D16 | 管理端以 HTTP 400 `invalid_request_error` 返回员工应看到的拒绝原因（额度、模型、授权码、部门 Key），`error.code` 给出机器可读原因；只有并发超限用 429 | 实测 DSH 界面把 401/403 显示为“API 密钥无效”、402 显示为“当前请求的额度已用尽”，丢掉管理端的具体原因；400 原样显示且不重试 | 401/402/403 |
+| D17 | 管理页面与员工设置使用 DSH Connection 的精确 Fetch 路由 `/api/genyee-keyhub/admin` 与 `/api/genyee-keyhub/employee`（只有本机 owner 可访问） | 上游 0.2.2-alpha.2 的 `connection.rpc.handle` 在 Connection 服务自己的上下文中读取 `webServer`，任何调用方都会失败（上游无生产调用方）；Fetch 路由不依赖它 | `connection.rpc.handle` 自定义通道 |
 
 ## 3. 威胁模型
 
@@ -169,16 +171,16 @@
 
 | 编号 | 验证项 | 通过标准 | 状态 |
 |---|---|---|---|
-| V1 | 桌面端宿主进程内，插件能自行监听内网端口 | 另一台机器能访问 `GET /keyhub/v1/status` | 待桌面端实测 |
-| V2 | `registerDeepSeekProvider` 可从树外包调用 | 员工端路由跑通一次对话，`anthropic-beta` 原样到达上游 | **通过**（npm 上的 `dsh` CLI 加载本插件跑 headless 任务，见 `pnpm test:e2e`）；带工具调用的多轮对话待真实 API 实测 |
-| V3 | DeepSeek Anthropic 端点接受 `metadata.user_id` | 带 `metadata.user_id` 的请求被正常处理 | 官方文档已确认字段位置为 `metadata.user_id`；待真实 API 实测 |
+| V1 | 桌面端宿主进程内，插件能自行监听内网端口 | 另一台机器能访问 `GET /keyhub/v1/status` | 本机已通过：管理端监听局域网 IP，员工 DSH 经该 IP + TLS + 指纹核对连接；跨机器与防火墙待两台电脑实测（docs/desktop-verification.md） |
+| V2 | `registerDeepSeekProvider` 可从树外包调用 | 员工端路由跑通一次带工具调用的多轮对话，`anthropic-beta` 原样到达上游 | **通过**：headless e2e；真实 API 下带工具调用的两轮对话经转发成功（`pnpm test:real`）；DSH Web 员工实例经 Genyee 路由对话成功 |
+| V3 | DeepSeek Anthropic 端点接受 `metadata.user_id` | 带 `metadata.user_id` 的请求被正常处理 | **通过**：真实 API 接受；同一 Key 下不同 `user_id` 不共享 KV Cache（员工 A 重复请求命中 6656 token 缓存，员工 B 相同请求命中 0） |
 | V4 | 员工端信任管理端证书的方式 | 员工无需改系统设置即可安全连接 | **已由设计解决**（D15）；自签证书 + 指纹核对已在 e2e 中验证 |
-| V5 | 树外包构建客户端半侧 | 上游的 `clientBundle` 构建预设不在已发布包里，需在我们仓库复刻；管理界面在桌面端能显示 | 待做（M2） |
-| V6 | 桌面端安装 `.tgz` 插件 | 确认桌面端所用 profile 名称，`dsh plugin add` 后重启生效 | 待桌面端实测；`dsh plugin add` 安装到 headless profile 已验证 |
+| V5 | 树外包构建客户端半侧 | 管理界面在 DSH 中能显示 | **通过（Web）**：`scripts/build-client.mjs` 生成 `lib/client.js`，管理页面与员工设置在 DSH Web 中显示并可操作；桌面端加载同一 Web Host |
+| V6 | 桌面端安装 `.tgz` 插件 | `dsh plugin add` 后重启生效 | **通过（Web profile）**：`dsh plugin --profile web add <tgz>` 后重启生效；桌面端 profile 为 `desktop`，待两台电脑实测 |
 | V7 | 上游包已在 npm 发布且版本可对齐 | `@deepseek-ai/dsh-llm-deepseek` 等依赖可按 `0.2.2-alpha.2` 安装 | **通过**（npm `alpha` 标签） |
-| V8 | 官方账号余额查询接口 | 能用 Key 查到账号余额 | 待真实 API 实测 |
-| V9 | 管理端返回的拒绝原因能显示给员工 | 员工 DSH 界面原样显示"额度已用完"一类提示，而不是笼统的网络错误 | 已核实上游把错误响应的 `error.message` 作为报错文本；待桌面端界面实测 |
-| V10 | 流式响应中的用量字段 | 能从 SSE 中取到输入（缓存命中、未命中）和输出 token，足以按价格表折算金额 | 字段名已从上游源码确认（`input_tokens`、`cache_read_input_tokens`、`cache_creation_input_tokens`、`output_tokens`）；待真实 API 实测 |
+| V8 | 官方账号余额查询接口 | 能用 Key 查到账号余额 | **通过**：`GET https://api.deepseek.com/user/balance`（`Authorization: Bearer` 或 `x-api-key`）返回 `is_available` 与 `balance_infos` |
+| V9 | 管理端返回的拒绝原因能显示给员工 | 员工 DSH 界面原样显示"额度已用完"一类提示 | **通过**（D16）：员工界面原样显示“你的本月额度已用完（……），请联系管理员”“你没有使用模型 deepseek-flash 的权限”“授权码无效或已被管理员停用”“无法连接管理端 ……请确认管理员的 DSH 已打开” |
+| V10 | 流式响应中的用量字段 | 能从 SSE 中取到输入（缓存命中、未命中）和输出 token | **通过**：`input_tokens` 不含缓存命中（6840 = 184 未命中 + 6656 命中），`cache_creation_input_tokens` 恒为 0；断开时的输出估算按实测中文约 4.8 字节/token 取 4 |
 
 ### M1 转发闭环（无界面）
 
@@ -186,7 +188,7 @@
 - 验收：
   - 两名员工同时对话，DeepSeek 收到两个不同的 `user_id`
   - 员工请求体中伪造的 `metadata.user_id` 被覆盖
-  - 停用员工后，下一次请求返回 401，进行中的流被中断
+  - 停用员工后，下一次请求被拒绝（D16：400 `keyhub_unauthorized`），进行中的流被中断
   - 上游请求中没有任何 `dsh_` 开头的字段和 `x-deepseek-harness-user-id`
   - 排队 5 分钟以上的请求不被转发层超时切断
 

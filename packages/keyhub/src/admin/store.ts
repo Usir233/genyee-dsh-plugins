@@ -12,9 +12,9 @@ import type { RequestOutcome } from './relay.ts'
 import type { TokenUsage } from './usage.ts'
 
 /** Ledger schema generation, stored in `PRAGMA user_version`; it only increases. */
-const SCHEMA_VERSION = 1
+const SCHEMA_VERSION = 2
 
-const SCHEMA = `
+const SCHEMA_V1 = `
 CREATE TABLE departments (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
@@ -73,6 +73,28 @@ CREATE INDEX usage_user_at ON usage(user_id, at);
 CREATE INDEX usage_department_at ON usage(department_id, at);
 `
 
+/** Generation 2: ledger settings, estimated usage rows, and Files API ownership. */
+const SCHEMA_V2 = `
+CREATE TABLE meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+ALTER TABLE usage ADD COLUMN estimated INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE files (
+  file_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  department_id TEXT NOT NULL,
+  at INTEGER NOT NULL
+);
+CREATE INDEX files_user ON files(user_id);
+`
+
+/** Migrations by the generation they produce. */
+const MIGRATIONS: ReadonlyArray<readonly [number, string]> = [[1, SCHEMA_V1], [2, SCHEMA_V2]]
+
+/** Time zone recorded before any admin started the relay on this ledger. */
+export const DEFAULT_TIME_ZONE = 'Asia/Shanghai'
+
 /** Who a quota or top-up applies to. */
 export type QuotaScope = 'employee' | 'department'
 
@@ -113,8 +135,37 @@ export interface UsageEntry {
   readonly status: number | undefined
   readonly outcome: RequestOutcome
   readonly usage: TokenUsage | undefined
+  /** Whether output tokens were estimated because the stream ended before its final usage. */
+  readonly estimated: boolean
   readonly costMicros: number
   readonly clientAddress: string | undefined
+}
+
+/** One usage row as stored, for reports and export. */
+export interface UsageRow {
+  readonly at: number
+  readonly userId: string
+  readonly departmentId: string
+  readonly model: string | undefined
+  readonly status: number | undefined
+  readonly outcome: string
+  readonly inputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+  readonly outputTokens: number
+  readonly estimated: boolean
+  readonly costMicros: number
+  readonly clientAddress: string | undefined
+}
+
+/** Filter of {@link KeyhubStore.usageRows}. */
+export interface UsageFilter {
+  /** Inclusive start, epoch milliseconds. */
+  readonly from: number
+  /** Exclusive end, epoch milliseconds. */
+  readonly to: number
+  readonly userId?: string
+  readonly departmentId?: string
 }
 
 /** Per-subject spending totals over a range. */
@@ -178,16 +229,51 @@ export class KeyhubStore {
       db.close()
       throw new Error(`keyhub: ${file} uses ledger schema ${version}; this plugin version reads up to ${SCHEMA_VERSION}`)
     }
-    if (version === 0) {
-      db.exec('BEGIN')
-      db.exec(SCHEMA)
-      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
-      db.exec('COMMIT')
+    if (version < SCHEMA_VERSION) {
+      try { KeyhubStore.migrate(db) }
+      catch (error) {
+        db.close()
+        throw error
+      }
     }
     return new KeyhubStore(db)
   }
 
+  /**
+   * Bring the schema to {@link SCHEMA_VERSION} in one write transaction.
+   * The generation is re-read under the write lock, so a concurrent opener that migrated first is not migrated again.
+   */
+  private static migrate(db: DatabaseSync): void {
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const current = num(db.prepare('PRAGMA user_version').get() as Row, 'user_version')
+      for (const [produces, sql] of MIGRATIONS) if (produces > current) db.exec(sql)
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`)
+      db.exec('COMMIT')
+    } catch (error) {
+      db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
   close(): void { this.db.close() }
+
+  /**
+   * The calendar of quota periods, written by the admin relay at startup.
+   * @returns the IANA time zone, {@link DEFAULT_TIME_ZONE} before the relay first ran.
+   */
+  timeZone(): string {
+    const row = this.db.prepare("SELECT value FROM meta WHERE key = 'time_zone'").get() as Row | undefined
+    return row === undefined ? DEFAULT_TIME_ZONE : str(row, 'value')
+  }
+
+  /**
+   * Record the calendar of quota periods; admin tools and the management page read it from here.
+   * @param timeZone - IANA time zone the relay uses.
+   */
+  setTimeZone(timeZone: string): void {
+    this.db.prepare("INSERT INTO meta (key, value) VALUES ('time_zone', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(timeZone)
+  }
 
   /**
    * Change counter of writes made through other connections.
@@ -300,7 +386,9 @@ export class KeyhubStore {
   }
 
   /**
-   * Set or clear a quota; spending before `now` stops counting against it.
+   * Set or clear a quota.
+   * Changing only the amount keeps the counting start, so spending and top-ups of the current window still count;
+   * setting a first quota or changing the period counts from `now`.
    * @param scope - employee or department.
    * @param id - user id or department id.
    * @param quota - amount and period, or `undefined` to remove the limit.
@@ -311,10 +399,14 @@ export class KeyhubStore {
       assertPeriod(quota.period)
       if (!Number.isSafeInteger(quota.micros) || quota.micros < 0) throw new Error('额度必须是非负金额')
     }
+    const subject = `${scope === 'employee' ? '员工' : '部门'} ${id}`
+    const current = scope === 'employee' ? this.employee(id) : this.department(id)
+    if (current === undefined) throw new Error(`${subject} 不存在`)
+    const since = quota === undefined ? null : current.quota?.period === quota.period ? current.quota.since : now
     const table = scope === 'employee' ? 'employees' : 'departments'
     const key = scope === 'employee' ? 'user_id' : 'id'
     this.requireChange(this.db.prepare(`UPDATE ${table} SET quota_micros = ?, quota_period = ?, quota_since = ? WHERE ${key} = ?`)
-      .run(quota?.micros ?? null, quota?.period ?? null, quota === undefined ? null : now, id), `${scope === 'employee' ? '员工' : '部门'} ${id}`)
+      .run(quota?.micros ?? null, quota?.period ?? null, since, id), subject)
   }
 
   /**
@@ -374,6 +466,15 @@ export class KeyhubStore {
   }
 
   /**
+   * Remove every price of a model; recorded usage keeps the cost computed when it completed.
+   * @param model - wire model id.
+   * @throws Error when the model has no price.
+   */
+  removePrice(model: string): void {
+    this.requireChange(this.db.prepare('DELETE FROM prices WHERE model = ?').run(model), `模型 ${model} 的价格`)
+  }
+
+  /**
    * The price in effect for a model at an instant.
    * @param model - wire model id.
    * @param at - the instant.
@@ -403,12 +504,74 @@ export class KeyhubStore {
    */
   recordUsage(entry: UsageEntry): void {
     const usage = entry.usage
-    this.db.prepare(`INSERT INTO usage (at, user_id, department_id, model, status, outcome, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, cost_micros, client_address)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+    this.db.prepare(`INSERT INTO usage (at, user_id, department_id, model, status, outcome, input_tokens, cache_read_tokens, cache_write_tokens, output_tokens, estimated, cost_micros, client_address)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
       entry.at, entry.userId, entry.departmentId, entry.model ?? null, entry.status ?? null, entry.outcome,
       usage?.inputTokens ?? 0, usage?.cacheReadTokens ?? 0, usage?.cacheWriteTokens ?? 0, usage?.outputTokens ?? 0,
-      entry.costMicros, entry.clientAddress ?? null,
+      entry.estimated ? 1 : 0, entry.costMicros, entry.clientAddress ?? null,
     )
+  }
+
+  /**
+   * Usage rows in a range, oldest first.
+   * @param filter - time range and optional employee or department.
+   * @returns the matching rows.
+   */
+  usageRows(filter: UsageFilter): UsageRow[] {
+    const clauses = ['at >= ?', 'at < ?']
+    const params: Array<string | number> = [filter.from, filter.to]
+    if (filter.userId !== undefined) {
+      clauses.push('user_id = ?')
+      params.push(filter.userId)
+    }
+    if (filter.departmentId !== undefined) {
+      clauses.push('department_id = ?')
+      params.push(filter.departmentId)
+    }
+    return (this.db.prepare(`SELECT * FROM usage WHERE ${clauses.join(' AND ')} ORDER BY at, id`).all(...params) as Row[]).map(row => ({
+      at: num(row, 'at'),
+      userId: str(row, 'user_id'),
+      departmentId: str(row, 'department_id'),
+      model: row.model === null ? undefined : str(row, 'model'),
+      status: optNum(row, 'status'),
+      outcome: str(row, 'outcome'),
+      inputTokens: num(row, 'input_tokens'),
+      cacheReadTokens: num(row, 'cache_read_tokens'),
+      cacheWriteTokens: num(row, 'cache_write_tokens'),
+      outputTokens: num(row, 'output_tokens'),
+      estimated: num(row, 'estimated') === 1,
+      costMicros: num(row, 'cost_micros'),
+      clientAddress: row.client_address === null ? undefined : str(row, 'client_address'),
+    }))
+  }
+
+  /**
+   * Record the employee who uploaded a file through the relay.
+   * @param fileId - DeepSeek file id.
+   * @param userId - the uploading employee.
+   * @param departmentId - the department whose key holds the file.
+   * @param now - upload time.
+   */
+  recordFile(fileId: string, userId: string, departmentId: string, now: number): void {
+    this.db.prepare('INSERT OR REPLACE INTO files (file_id, user_id, department_id, at) VALUES (?, ?, ?, ?)').run(fileId, userId, departmentId, now)
+  }
+
+  /**
+   * The employee who uploaded a file.
+   * @param fileId - DeepSeek file id.
+   * @returns the uploader's user id, or `undefined` for a file the relay did not upload.
+   */
+  fileOwner(fileId: string): string | undefined {
+    const row = this.db.prepare('SELECT user_id FROM files WHERE file_id = ?').get(fileId) as Row | undefined
+    return row === undefined ? undefined : str(row, 'user_id')
+  }
+
+  /**
+   * Forget a deleted file.
+   * @param fileId - DeepSeek file id.
+   */
+  forgetFile(fileId: string): void {
+    this.db.prepare('DELETE FROM files WHERE file_id = ?').run(fileId)
   }
 
   /**

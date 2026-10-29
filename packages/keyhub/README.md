@@ -1,25 +1,44 @@
 # @genyee/dsh-keyhub
 
-Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。管理员的 DSH 保管公司 DeepSeek 账号下各部门的 API Key，在内网转发员工的模型请求，并按员工强制写入 DeepSeek 的 `metadata.user_id`。员工只持有管理员发放的接入码，拿不到真实 Key。设计依据见仓库根目录的 [GENYEE_KEYHUB_DIRECTION.md](../../GENYEE_KEYHUB_DIRECTION.md)。
+Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。管理员的 DSH 保管公司 DeepSeek 账号下各部门的 API Key，在内网转发员工的模型请求，并按员工强制写入 DeepSeek 的 `metadata.user_id`、执行金额额度。员工只持有管理员发放的接入码，拿不到真实 Key。设计依据见仓库根目录的 [GENYEE_KEYHUB_DIRECTION.md](../../GENYEE_KEYHUB_DIRECTION.md)。
 
-当前进度：转发、两级金额额度、价格表、模型与并发限制已实现；数据存在管理员电脑上的 SQLite 账本中，暂时用命令行工具维护。管理界面尚未实现。
+## 界面
+
+- **管理页面**（只在管理员的 DSH 中出现）：左侧栏“Genyee 密钥中心”。六个标签：
+  - **部门**：新增、停用部门，设置部门 Key。
+  - **员工**：新增、停用、调整部门、限制可用模型和并发、重置接入码。接入码只显示一次。
+  - **额度**：部门和员工两级额度，以及临时追加。
+  - **价格**：按模型维护价格，可删除。
+  - **用量**：按日期查看部门和员工的金额与 token，导出 CSV。
+  - **服务状态**：转发地址、证书指纹、账号余额。
+- **员工设置**（每个安装了本插件的 DSH 都有）：设置 → Genyee 密钥中心。在这里粘贴接入码，查看连接状态、可用模型和剩余额度。
+
+管理页面和员工设置通过 DSH 的 `/api/genyee-keyhub/admin` 与 `/api/genyee-keyhub/employee` 两个接口工作。DSH 只允许本机用户本人（owner）访问这两个接口；员工能访问的只有转发服务。
 
 ## 转发时做什么
 
 每个发往 `/anthropic/v1/messages` 的请求，管理端依次：
 
-1. 用请求头 `x-api-key` 中的授权码查账本；未知、员工停用或部门停用时返回 401，请求不发往 DeepSeek。
-2. 依次检查：模型在员工的可用列表内（403）、该模型已设置价格（400）、员工同时进行的请求数未超上限（429）、员工额度和部门额度都有余额（402）。任一项不满足即拒绝，提示文字会显示在员工的 DSH 中。
-3. 把请求体的 `metadata.user_id` 设为该员工的 `userId`，覆盖员工端传来的值；删除所有 `dsh_` 开头的 DSH 扩展字段（包括插件清单 `dsh_plugin_packages` 和会话日志 `dsh_session_log`）。
-4. 把 `x-api-key` 换成该员工所属部门的 Key，删除 `x-deepseek-harness-user-id`（设备匿名 ID）。
-5. 流式原样转发响应，包括 DeepSeek 排队时的 `: keep-alive` 注释；无数据等待上限默认 600 秒。
-6. 从响应中读取用量，按请求完成时的价格折算金额，记入账本。
+1. **校验授权码**：用请求头 `x-api-key` 中的授权码查账本。授权码未知、员工停用或部门停用时拒绝，请求不发往 DeepSeek。
+2. **检查限制**，任一项不满足即拒绝：
+   - 模型在员工的可用列表内；
+   - 该模型已设置价格；
+   - 员工同时进行的请求数未超上限；
+   - 员工额度和部门额度都有余额。“已用”包括进行中的请求按 `max_tokens` 预留的金额，多个并发请求不能一起冲破额度。
+3. **改写请求体**：把 `metadata.user_id` 设为该员工的 `userId`，覆盖员工端传来的值；删除所有 `dsh_` 开头的 DSH 扩展字段，包括插件清单 `dsh_plugin_packages` 和会话日志 `dsh_session_log`。
+4. **改写请求头**：把 `x-api-key` 换成该员工所属部门的 Key，删除 `x-deepseek-harness-user-id`（设备匿名 ID）。
+5. **流式转发**：原样转发响应，包括 DeepSeek 排队时的 `: keep-alive` 注释。没有数据时最多等待 600 秒。
+6. **记账**：从响应中读取用量，按请求完成时的价格折算金额，记入账本。如果员工在 DeepSeek 返回最终用量前断开，已生成的输出按每 4 字节 1 个 token 估算计费，并在用量记录中标为“估算”。
 
-账本变化（包括命令行工具在 DSH 运行期间写入）约 1 秒内生效；被停用或重置授权码的员工，进行中的请求会立即中断。
+**拒绝时员工看到什么**：拒绝原因以 HTTP 400 `invalid_request_error` 返回，`error.code` 是机器可读的原因（如 `keyhub_quota_exhausted`、`keyhub_model_not_allowed`、`keyhub_unauthorized`）。DSH 会把 401、402、403 换成自己的通用提示（如“API 密钥无效”），而 400 会原样显示管理端写的中文原因。并发超限是唯一的例外，返回 429，DSH 会自动重试。
+
+**变更生效时间**：账本变化（包括命令行工具在 DSH 运行期间的写入）约 1 秒内生效。员工被停用、重置授权码或调整部门时，进行中的请求立即中断。
+
+**Files API**：DSH 上传图片时使用 `/anthropic/v1/files`。管理端记录每个文件的上传者：列表只返回本人的文件，读取或删除他人的文件返回 404。上传同样受额度限制，没有声明长度的上传也按累计字节执行大小上限。
 
 ## 安装
 
-两种模式安装同一个包。组合包默认是员工模式，并把默认模型切换到 `genyee-keyhub` 路由；同时关闭插件清单和会话日志上传。
+两种模式安装同一个包。组合包默认是员工模式，并把默认模型切换到 `genyee-keyhub` 路由；同时关闭插件清单和会话日志上传。桌面端可以在“插件 → 添加插件”中填入 `.tgz` 的绝对路径，也可以用命令行：
 
 ```sh
 dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
@@ -27,13 +46,13 @@ dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
 
 ### 管理员
 
-1. 生成转发服务的证书（证书里写入管理员电脑的内网 IP）：
+1. **生成证书**：生成转发服务的证书，证书里写入管理员电脑的内网 IP。插件安装后自带命令 `genyee-keyhub-admin`；下文的 `T` 代表 `node <profile 目录>/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js`。
 
    ```sh
-   node node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js make-cert --ip 10.0.0.8 --out ~/.genyee-keyhub
+   T make-cert --ip 10.0.0.8 --out ~/.genyee-keyhub
    ```
 
-2. 在管理员 profile 的 `cordis.patch.yml` 末尾**新增**一行管理员模式的插件行。组合包自带的员工行保持不变，管理员自己用 DSH 时也走本机转发，用量记在管理员自己的员工条目下：
+2. **新增管理员插件行**：在管理员 profile 的 `cordis.patch.yml` 末尾新增一行管理员模式的插件行。组合包自带的员工行保持不变，管理员自己用 DSH 时也走本机转发，用量记在管理员自己的员工条目下。
 
    ```yaml
    - insert:
@@ -48,39 +67,50 @@ dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
            ledgerFile: /home/admin/.genyee-keyhub/ledger.db
    ```
 
-   `listenHost` 必须是本机某个网卡的具体 IP，不接受 `0.0.0.0`。不配置证书时必须显式写 `insecureHttp: true`，此时授权码在内网明文传输。管理员也用下文的 `employee-add` 给自己建一个员工条目，并按“员工”一节保存自己的接入码。
+   - `listenHost` 必须是本机某个网卡的具体 IP，不接受 `0.0.0.0`、`::` 等通配写法。IP 变了时插件会拒绝启动并提示。
+   - 不配置证书时必须显式写 `insecureHttp: true`，此时授权码在内网明文传输。
 
-3. 用命令行工具维护账本（下文 `T` 代表 `node node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js`，`DB` 代表账本路径）。金额单位为元，价格单位为元/百万 token：
+3. **在管理页面完成配置**：重启 DSH 后打开左侧栏“Genyee 密钥中心”，按以下顺序操作：
+   1. 部门 → 新增部门 → 设置 Key；
+   2. 价格 → 按 DeepSeek 官网价格填写；
+   3. 员工 → 新增员工（也给管理员自己建一条），把只显示一次的接入码交给员工；
+   4. 额度 → 按需设置。
 
-   ```sh
-   T department --db DB --id rd --name 研发部 --key-ref GENYEE_DEEPSEEK_KEY_RD
-   T price --db DB --model deepseek-flash --hit 0.2 --miss 2 --output 3
-   T employee-add --db DB --name 张三 --department rd --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
-   T quota --db DB --department rd --amount 5000 --period month
-   T quota --db DB --employee emp_xxx --amount 200 --period week
-   T top-up --db DB --employee emp_xxx --amount 50 --note 项目加急
-   T employee --db DB --user emp_xxx --models deepseek-flash --max-concurrency 4
-   T employee --db DB --user emp_xxx --disable
-   T employee --db DB --user emp_xxx --reset-token --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
-   T report --db DB
-   ```
+   管理员自己的接入码在“设置 → Genyee 密钥中心”中粘贴。
 
-   - `--key-ref` 是凭据引用名；对应的 DeepSeek Key 存在管理员 DSH 的凭据库中（或管理员启动 DSH 的环境变量中），账本本身不含 Key。
-   - `employee-add` 输出员工的接入码，只显示一次；账本只保存授权码的 SHA-256。
-   - 额度周期为 `day`、`week`（周一起）、`month`、`year` 或 `total`（不重置），按 `timeZone` 的日历计算；修改额度从修改时刻起计算，不追溯之前的用量。追加额度只在当前周期有效，`total` 的追加永久有效。
-   - 价格表里没有的模型会被拒绝；改价只影响之后完成的请求。
+部门 Key 存在管理员 DSH 的凭据库中（文件 `<DSH 数据目录>/.credentials.yaml`），账本只保存凭据引用名（如 `GENYEE_DEEPSEEK_KEY_RD`）和授权码的 SHA-256。
+
+### 命令行工具
+
+管理页面的所有操作也可以用命令行完成，DSH 运行期间写入同样约 1 秒内生效。周期和日期按管理端记录在账本中的时区计算。
+
+```sh
+T department --db DB --id rd --name 研发部 --key-ref GENYEE_DEEPSEEK_KEY_RD
+T price --db DB --model deepseek-flash --hit 0.2 --miss 2 --output 3
+T employee-add --db DB --name 张三 --department rd --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
+T quota --db DB --department rd --amount 5000 --period month
+T top-up --db DB --employee emp_xxx --amount 50 --note 项目加急
+T employee --db DB --user emp_xxx --models deepseek-flash --max-concurrency 4
+T employee --db DB --user emp_xxx --disable
+T employee --db DB --user emp_xxx --reset-token --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
+T report --db DB
+T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
+```
+
+额度规则：
+
+- **周期**：`day`、`week`（周一起）、`month`、`year` 或 `total`（不重置）。
+- **追加**：只在当前周期有效；`total` 的追加永久有效。
+- **修改额度**：只改金额时保留本周期已用和追加；改周期从修改时刻重新计算。
+- **价格**：价格表里没有的模型会被拒绝；改价只影响之后完成的请求。
 
 ### 员工
 
-把管理员给的接入码存为凭据 `GENYEE_KEYHUB_ACCESS_CODE`：在 DSH 的凭据文件（macOS `~/.dsh/.credentials.yaml`，Windows `%USERPROFILE%\.dsh\.credentials.yaml`）的 `refs` 下加一行，保存后自动生效；也可以用同名环境变量。
+在 DSH 的“设置 → Genyee 密钥中心”中粘贴管理员给的接入码并保存，然后在模型选择器中选择 Genyee 路由。设置页会显示是否已连接、可用模型和剩余额度。
 
-```yaml
-version: 1
-refs:
-  GENYEE_KEYHUB_ACCESS_CODE: gkh1.eyJ1Ijoi…
-```
+接入码保存在 DSH 凭据库中，引用名为 `GENYEE_KEYHUB_ACCESS_CODE`。headless 等没有凭据库的 profile 也可以用同名环境变量。
 
-员工端在本机 `127.0.0.1` 上开一个随机端口，DSH 的模型请求经它转发给管理端；连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
+员工端在本机 `127.0.0.1` 上开一个随机端口，DSH 的模型请求经它转发给管理端。连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
 
 ## 配置
 
@@ -92,21 +122,31 @@ refs:
 | `tlsCertFile` / `tlsKeyFile` | admin | — | PEM 证书和私钥 |
 | `insecureHttp` | admin | `false` | 不用证书、明文 HTTP |
 | `ledgerFile` | admin | 必填 | SQLite 账本，不存在时自动创建 |
-| `timeZone` | admin | `Asia/Shanghai` | 额度周期使用的日历 |
+| `timeZone` | admin | `Asia/Shanghai` | 额度周期使用的日历；启动时写入账本，命令行工具和管理页面都按它计算 |
 | `defaultMaxConcurrency` | admin | `8` | 员工未单独设置时的并发上限 |
 | `upstreamBaseURL` | admin | `https://api.deepseek.com/anthropic` | DeepSeek Anthropic 接口 |
 | `upstreamReadTimeoutMs` | admin | `600000`（最小值） | 上游无数据等待上限 |
 | `maxRequestBytes` | admin | 64 MiB | 请求体上限 |
+| `balanceURL` | admin | `https://api.deepseek.com/user/balance` | 账号余额接口 |
+| `balancePollMinutes` | admin | `10` | 余额查询间隔，`0` 关闭；失败时 1 分钟后重试 |
+| `lowBalanceYuan` | admin | `50` | 余额低于此值（元）时在服务状态页和日志中提醒 |
 | `accessCodeRef` | employee | `GENYEE_KEYHUB_ACCESS_CODE` | 存放接入码的凭据名 |
+| `relayReadTimeoutMs` | employee | `660000` | 等待管理端数据的上限，应大于管理端的 `upstreamReadTimeoutMs` |
 
 ## 测试
 
 ```sh
-pnpm test        # 单元与转发测试，使用本地模拟的 DeepSeek
-pnpm test:e2e    # 构建后用 npm 上的 dsh CLI 加载本插件，跑一次 headless 任务（TLS + 指纹核对）
+pnpm test         # 单元、转发、账本与管理接口测试，使用本地模拟的 DeepSeek
+pnpm test:e2e     # 构建后用 npm 上的 dsh CLI 加载本插件，跑一次 headless 任务（TLS + 指纹核对）
+pnpm test:real    # 用真实 DeepSeek API 测试转发（需要 DEEPSEEK_API_KEY 或仓库根目录 .env；会产生少量费用）
 ```
+
+`pnpm build` 同时构建服务端（`lib/`）和浏览器端（`lib/client.js`，由 `scripts/build-client.mjs` 生成 DSH 客户端模块格式）。
 
 ## 已知限制
 
-- Files API 请求会转发，但尚未记录文件归属，员工理论上可以引用同事上传的文件 id。
-- 管理界面尚未实现；命令行工具需要管理员电脑上装有 Node.js 24 以上版本。
+- 管理员的 DSH 必须开着，员工才能使用；管理端关闭时员工看到“无法连接管理端”。
+- 同一版本号的 `.tgz` 重新安装时，pnpm 会沿用已安装的内容；替换为同版本的新构建前先 `dsh plugin --profile <profile> remove @genyee/dsh-keyhub`。
+- 员工端本机中转的端口和密钥每次启动都会变，DSH 的图片上传缓存因此在重启后失效，会重新上传。
+- 断开连接时的输出估算按实测的中文约 4.8 字节/token 取 4 字节/token，略高于实际。
+- DSH 在额度用尽（402）等情况下会在界面上替换掉服务端的提示文字，本插件因此用 400 返回拒绝原因（见“转发时做什么”）。

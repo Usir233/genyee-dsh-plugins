@@ -1,7 +1,7 @@
 {
   "name": "@genyee/dsh-keyhub",
   "description": "Genyee 密钥中心：管理员 DSH 集中保管 DeepSeek Key、按员工强制写入 user_id 并执行金额额度",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "lib/index.js",
@@ -11,11 +11,19 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./client": "./lib/client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
+  },
+  "bin": {
+    "genyee-keyhub-admin": "./lib/tools/admin-tools.js"
   },
   "files": [
     "lib/**/*.js",
     "lib/**/*.d.ts",
+    "locale/*.json",
+    "icon.svg",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -26,29 +34,43 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
     }
   },
   "scripts": {
-    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "build": "node -e \"require('node:fs').rmSync('lib',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node scripts/build-client.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
     "test": "vitest run",
-    "test:e2e": "pnpm run build && vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "pnpm run build && vitest run --config vitest.e2e.config.ts",
+    "test:real": "vitest run --config vitest.real.config.ts"
   },
   "peerDependencies": {
     "@deepseek-ai/cordis": "4.0.6-alpha.1",
+    "@deepseek-ai/dsh-client-connection": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-credentials": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-launch-environment": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-llm": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-llm-deepseek": "0.2.2-alpha.2"
   },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-connection": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "@deepseek-ai/cordis": "4.0.6-alpha.1",
     "@deepseek-ai/dsh": "0.2.2-alpha.2",
+    "@deepseek-ai/dsh-client-connection": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-credentials": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-launch-environment": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-llm": "0.2.2-alpha.2",
     "@deepseek-ai/dsh-llm-deepseek": "0.2.2-alpha.2",
     "@types/node": "^24.9.0",
+    "@types/react": "~18.3.31",
+    "esbuild": "^0.25.12",
+    "react": "^18.3.1",
     "typescript": "^6.0.3",
     "vitest": "^4.1.11"
   },

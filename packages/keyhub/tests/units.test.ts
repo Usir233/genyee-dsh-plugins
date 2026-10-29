@@ -104,7 +104,16 @@ describe('usage taps', () => {
       + 'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
     const bytes = Buffer.from(stream)
     for (let offset = 0; offset < bytes.length; offset += 7) tap.push(bytes.subarray(offset, offset + 7))
-    expect(tap.finish()).toEqual({ inputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 9 })
+    expect(tap.finish()).toEqual({ usage: { inputTokens: 4, cacheReadTokens: 2, cacheWriteTokens: 0, outputTokens: 9 }, estimated: false })
+  })
+
+  it('estimates output from streamed text when the final usage never arrives', () => {
+    const tap = streamUsageTap()
+    tap.push(Buffer.from('event: message_start\ndata: {"type":"message_start","message":{"usage":{"input_tokens":4,"output_tokens":1}}}\n\n'
+      + 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"你好世界"}}\n\n'
+      + 'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\\"a\\":1}"}}\n\n'))
+    // 12 bytes of text and 7 of JSON at 4 bytes per token.
+    expect(tap.finish()).toEqual({ usage: { inputTokens: 4, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 5 }, estimated: true })
   })
 
   it('reports nothing for a stream without usage', () => {
@@ -116,7 +125,7 @@ describe('usage taps', () => {
   it('reads usage from a JSON body within the limit', () => {
     const tap = jsonUsageTap(1000)
     tap.push(Buffer.from('{"usage":{"input_tokens":1,"output_tokens":2}}'))
-    expect(tap.finish()).toEqual({ inputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2 })
+    expect(tap.finish()).toEqual({ usage: { inputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0, outputTokens: 2 }, estimated: false })
     const large = jsonUsageTap(4)
     large.push(Buffer.from('{"usage":{}}'))
     expect(large.finish()).toBeUndefined()

@@ -26,6 +26,12 @@ export interface AdminConfig {
   upstreamReadTimeoutMs: number
   /** Largest accepted request body, in bytes. */
   maxRequestBytes: number
+  /** DeepSeek account balance endpoint, queried with an enabled department key. */
+  balanceURL: string
+  /** Minutes between account balance queries; `0` turns them off. */
+  balancePollMinutes: number
+  /** Balance in 元 below which the management page and the log warn. */
+  lowBalanceYuan: number
 }
 
 /** Settings of the employee role, which reaches the company models only through the admin relay. */
@@ -33,6 +39,8 @@ export interface EmployeeConfig {
   role: 'employee'
   /** Credential reference holding the access code the admin issued to this employee. */
   accessCodeRef: string
+  /** Idle read timeout of one relay response; keep it above the admin's `upstreamReadTimeoutMs`. */
+  relayReadTimeoutMs: number
 }
 
 /** Settings of one plugin row. */
@@ -54,11 +62,15 @@ const AdminConfigSchema: z<AdminConfig> = z.object({
   upstreamBaseURL: z.string().default('https://api.deepseek.com/anthropic'),
   upstreamReadTimeoutMs: z.natural().min(MIN_UPSTREAM_READ_TIMEOUT_MS).default(MIN_UPSTREAM_READ_TIMEOUT_MS),
   maxRequestBytes: z.natural().min(1).default(64 * 1024 * 1024),
+  balanceURL: z.string().default('https://api.deepseek.com/user/balance'),
+  balancePollMinutes: z.natural().default(10),
+  lowBalanceYuan: z.number().min(0).default(50),
 })
 
 const EmployeeConfigSchema: z<EmployeeConfig> = z.object({
   role: z.const('employee').required(),
   accessCodeRef: z.string().default('GENYEE_KEYHUB_ACCESS_CODE'),
+  relayReadTimeoutMs: z.natural().min(MIN_UPSTREAM_READ_TIMEOUT_MS).default(MIN_UPSTREAM_READ_TIMEOUT_MS + 60_000),
 })
 
 export const Config: z<Config> = z.union([AdminConfigSchema, EmployeeConfigSchema])

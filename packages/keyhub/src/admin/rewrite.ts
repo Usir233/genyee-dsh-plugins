@@ -26,7 +26,7 @@ const DROPPED_RESPONSE_HEADERS = new Set([
 
 /** Outcome of rewriting one Messages request body. */
 export type BodyRewrite =
-  | { readonly ok: true, readonly body: Buffer, readonly model: string | undefined }
+  | { readonly ok: true, readonly body: Buffer, readonly model: string | undefined, readonly maxTokens: number | undefined }
   | { readonly ok: false, readonly reason: string }
 
 /**
@@ -34,7 +34,7 @@ export type BodyRewrite =
  * Overwrites `metadata.user_id`, keeps the other `metadata` fields, and removes every DSH body extension field.
  * @param raw - the request body the employee sent.
  * @param userId - the employee's DeepSeek `user_id`.
- * @returns the rewritten JSON body and its `model`, or the reason the body is not a JSON object.
+ * @returns the rewritten JSON body with its `model` and `max_tokens`, or the reason the body is not a JSON object.
  */
 export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
   let parsed: unknown
@@ -47,7 +47,22 @@ export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
     : {}
   body.metadata = { ...metadata, user_id: userId }
   for (const field of Object.keys(body)) if (field.startsWith(DSH_EXTENSION_PREFIX)) delete body[field]
-  return { ok: true, body: Buffer.from(JSON.stringify(body), 'utf8'), model: typeof body.model === 'string' ? body.model : undefined }
+  return {
+    ok: true,
+    body: Buffer.from(JSON.stringify(body), 'utf8'),
+    model: typeof body.model === 'string' ? body.model : undefined,
+    maxTokens: typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0 ? body.max_tokens : undefined,
+  }
+}
+
+/**
+ * Header names a message lists in its `Connection` header; they are hop-by-hop for that message.
+ * @param headers - the message headers.
+ * @returns lowercase names.
+ */
+function connectionListed(headers: IncomingHttpHeaders): Set<string> {
+  const value = headers.connection
+  return new Set((value ?? '').split(',').map(name => name.trim().toLowerCase()).filter(name => name.length > 0))
 }
 
 /**
@@ -59,8 +74,9 @@ export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
  */
 export function upstreamHeaders(incoming: IncomingHttpHeaders, apiKey: string, contentLength: number | undefined): OutgoingHttpHeaders {
   const headers: OutgoingHttpHeaders = {}
+  const listed = connectionListed(incoming)
   for (const [name, value] of Object.entries(incoming)) {
-    if (value === undefined || DROPPED_REQUEST_HEADERS.has(name)) continue
+    if (value === undefined || DROPPED_REQUEST_HEADERS.has(name) || listed.has(name)) continue
     headers[name] = value
   }
   headers['x-api-key'] = apiKey
@@ -76,8 +92,9 @@ export function upstreamHeaders(incoming: IncomingHttpHeaders, apiKey: string, c
  */
 export function downstreamHeaders(upstream: IncomingHttpHeaders): OutgoingHttpHeaders {
   const headers: OutgoingHttpHeaders = {}
+  const listed = connectionListed(upstream)
   for (const [name, value] of Object.entries(upstream)) {
-    if (value === undefined || DROPPED_RESPONSE_HEADERS.has(name)) continue
+    if (value === undefined || DROPPED_RESPONSE_HEADERS.has(name) || listed.has(name)) continue
     headers[name] = value
   }
   return headers

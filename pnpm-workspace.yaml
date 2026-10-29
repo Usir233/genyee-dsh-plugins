@@ -337,3 +337,5 @@ allowBuilds:
   koffi: false
   node-pty: false
   protobufjs: false
+  # The client bundler runs from its platform package binary; its install script only re-verifies that binary.
+  esbuild: false

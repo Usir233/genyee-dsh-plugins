@@ -1,6 +1,6 @@
 # Genyee 密钥中心（`@genyee/dsh-keyhub`）方向文档
 
-> 状态：M1 转发闭环、M2（管理界面、额度、价格、模型与并发限制、用量导出、账号余额、Files 归属）已在 `dev` 分支实现，版本 0.2.0。M0 除跨机器项外均已通过（2026-10-29，真实 DeepSeek API + 本机两个 DSH Web 实例），见 §6。
+> 状态：M1 转发闭环、M2（管理界面、额度、价格、模型与并发限制、用量导出、账号余额、Files 归属）已在 `dev` 分支实现，版本 0.2.0。M0 除跨机器项外均已通过（2026-10-29，真实 DeepSeek API、本机两个 DSH Web 实例和一个从源码运行的桌面端），见 §6。
 > 基线：上游 `@deepseek-ai/dsh-root` `0.2.2-alpha.2`。
 > 关系：本文取代 `Usir233/DSH-GENYEE` 仓库中的 DSH_ENTERPRISE_PLAN.md 的第 5 节（模式 A/B 选型）和第 6 节中与密钥、网关相关的工作流；该文档其余部分作为背景材料保留。
 
@@ -175,8 +175,8 @@
 | V2 | `registerDeepSeekProvider` 可从树外包调用 | 员工端路由跑通一次带工具调用的多轮对话，`anthropic-beta` 原样到达上游 | **通过**：headless e2e；真实 API 下带工具调用的两轮对话经转发成功（`pnpm test:real`）；DSH Web 员工实例经 Genyee 路由对话成功 |
 | V3 | DeepSeek Anthropic 端点接受 `metadata.user_id` | 带 `metadata.user_id` 的请求被正常处理 | **通过**：真实 API 接受；同一 Key 下不同 `user_id` 不共享 KV Cache（员工 A 重复请求命中 6656 token 缓存，员工 B 相同请求命中 0） |
 | V4 | 员工端信任管理端证书的方式 | 员工无需改系统设置即可安全连接 | **已由设计解决**（D15）；自签证书 + 指纹核对已在 e2e 中验证 |
-| V5 | 树外包构建客户端半侧 | 管理界面在 DSH 中能显示 | **通过（Web）**：`scripts/build-client.mjs` 生成 `lib/client.js`，管理页面与员工设置在 DSH Web 中显示并可操作；桌面端加载同一 Web Host |
-| V6 | 桌面端安装 `.tgz` 插件 | `dsh plugin add` 后重启生效 | **通过（Web profile）**：`dsh plugin --profile web add <tgz>` 后重启生效；桌面端 profile 为 `desktop`，待两台电脑实测 |
+| V5 | 树外包构建客户端半侧 | 管理界面在 DSH 中能显示 | **通过**：`scripts/build-client.mjs` 生成 `lib/client.js`；管理页面与员工设置在 DSH Web 中显示并可操作，员工设置在从源码运行的桌面端（0.2.2-alpha.2）中显示并可保存接入码 |
+| V6 | 桌面端安装 `.tgz` 插件 | `dsh plugin add` 后重启生效 | **通过**：Web profile 用 `dsh plugin --profile web add <tgz>`；桌面端在“插件 → 添加插件”中填入 `.tgz` 路径安装、点“立即启用”后无需重启即生效，员工经 Genyee 路由对话成功 |
 | V7 | 上游包已在 npm 发布且版本可对齐 | `@deepseek-ai/dsh-llm-deepseek` 等依赖可按 `0.2.2-alpha.2` 安装 | **通过**（npm `alpha` 标签） |
 | V8 | 官方账号余额查询接口 | 能用 Key 查到账号余额 | **通过**：`GET https://api.deepseek.com/user/balance`（`Authorization: Bearer` 或 `x-api-key`）返回 `is_available` 与 `balance_infos` |
 | V9 | 管理端返回的拒绝原因能显示给员工 | 员工 DSH 界面原样显示"额度已用完"一类提示 | **通过**（D16）：员工界面原样显示“你的本月额度已用完（……），请联系管理员”“你没有使用模型 deepseek-flash 的权限”“授权码无效或已被管理员停用”“无法连接管理端 ……请确认管理员的 DSH 已打开” |

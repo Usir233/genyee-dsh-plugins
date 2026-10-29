@@ -1,7 +1,7 @@
 {
   "name": "@genyee/dsh-keyhub",
   "description": "Genyee 密钥中心：管理员 DSH 集中保管 DeepSeek Key、按员工强制写入 user_id 并执行金额额度",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "main": "lib/index.js",
@@ -29,7 +29,7 @@
   ],
   "license": "UNLICENSED",
   "engines": {
-    "dsh": "0.2.2-alpha.2"
+    "dsh": ">=0.2.1-rc.1 <0.3.0"
   },
   "dsh": {
     "bundle": {
@@ -44,15 +44,16 @@
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json",
     "test": "vitest run",
     "test:e2e": "pnpm run build && vitest run --config vitest.e2e.config.ts",
-    "test:real": "vitest run --config vitest.real.config.ts"
+    "test:real": "vitest run --config vitest.real.config.ts",
+    "test:compat": "pnpm run build && node scripts/compat.mjs"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "4.0.6-alpha.1",
-    "@deepseek-ai/dsh-client-connection": "0.2.2-alpha.2",
-    "@deepseek-ai/dsh-credentials": "0.2.2-alpha.2",
-    "@deepseek-ai/dsh-launch-environment": "0.2.2-alpha.2",
-    "@deepseek-ai/dsh-llm": "0.2.2-alpha.2",
-    "@deepseek-ai/dsh-llm-deepseek": "0.2.2-alpha.2"
+    "@deepseek-ai/cordis": ">=4.0.5 <4.1.0 || >=4.0.6-alpha.1 <4.1.0",
+    "@deepseek-ai/dsh-client-connection": ">=0.2.1-rc.1 <0.3.0 || >=0.2.2-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-credentials": ">=0.2.1-rc.1 <0.3.0 || >=0.2.2-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-launch-environment": ">=0.2.1-rc.1 <0.3.0 || >=0.2.2-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-llm": ">=0.2.1-rc.1 <0.3.0 || >=0.2.2-alpha.1 <0.3.0",
+    "@deepseek-ai/dsh-llm-deepseek": ">=0.2.1-rc.1 <0.3.0 || >=0.2.2-alpha.1 <0.3.0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/dsh-client-connection": {
@@ -71,6 +72,7 @@
     "@types/react": "~18.3.31",
     "esbuild": "^0.25.12",
     "react": "^18.3.1",
+    "semver": "^7.7.2",
     "typescript": "^6.0.3",
     "vitest": "^4.1.11"
   },

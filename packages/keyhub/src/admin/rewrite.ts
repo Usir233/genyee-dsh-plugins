@@ -1,11 +1,6 @@
 /** Request rewriting applied by the admin relay before a request leaves for DeepSeek. */
 import type { IncomingHttpHeaders, OutgoingHttpHeaders } from 'node:http'
-
-/**
- * Prefix DSH reserves for its request body extensions, such as `dsh_plugin_packages` (enabled plugin packages)
- * and `dsh_session_log` (the session's event log); no such field is forwarded.
- */
-const DSH_EXTENSION_PREFIX = 'dsh_'
+import { removeDshExtensions } from '../dsh-extensions.ts'
 
 /**
  * Request headers dropped before forwarding: hop-by-hop headers, the employee's
@@ -46,7 +41,7 @@ export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
     ? body.metadata as Record<string, unknown>
     : {}
   body.metadata = { ...metadata, user_id: userId }
-  for (const field of Object.keys(body)) if (field.startsWith(DSH_EXTENSION_PREFIX)) delete body[field]
+  removeDshExtensions(body)
   return {
     ok: true,
     body: Buffer.from(JSON.stringify(body), 'utf8'),

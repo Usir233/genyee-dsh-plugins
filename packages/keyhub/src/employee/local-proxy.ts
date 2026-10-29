@@ -1,31 +1,34 @@
 /**
  * Loopback proxy between the employee's DSH model route and the admin relay.
  * The DSH adapter sends requests with the global `fetch`, which cannot pin a certificate per request;
- * this proxy receives them on 127.0.0.1, swaps the per-launch secret for the employee's token,
- * and forwards them through a {@link PinnedAgent}.
+ * this proxy receives them on 127.0.0.1, removes DSH's body extensions and device identifier, swaps the route
+ * secret for the employee's token, and forwards them through a {@link PinnedAgent}.
  */
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { timingSafeEqual } from 'node:crypto'
 import type { Agent, IncomingMessage, OutgoingHttpHeaders, Server, ServerResponse } from 'node:http'
 import { createServer, request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import type { AddressInfo } from 'node:net'
 import type { AccessCode } from '../access-code.ts'
+import { stripDshExtensions } from '../dsh-extensions.ts'
 import { FingerprintMismatchError, PinnedAgent } from './pinned-agent.ts'
 
-/** Request headers not forwarded to the relay. */
+/** Request headers not forwarded to the relay, including DSH's anonymous device identifier. */
 const DROPPED_HEADERS = new Set([
   'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'te', 'trailer', 'host', 'x-api-key', 'authorization',
+  'content-length', 'x-deepseek-harness-user-id',
 ])
 
 /** Response headers not forwarded back to the adapter. */
 const DROPPED_RESPONSE_HEADERS = new Set(['connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade', 'trailer'])
 
+/** Path of Messages requests, whose JSON bodies lose their DSH extensions here. */
+const MESSAGES_PATH = '/anthropic/v1/messages'
+
 /** A running loopback proxy. */
 export interface LocalProxy {
   /** Base URL the DSH route uses, ending in `/anthropic`. */
   readonly baseURL: string
-  /** Per-launch secret the DSH route presents as its `x-api-key`. */
-  readonly secret: string
   /** Stop listening and abort open exchanges. */
   close(): Promise<void>
 }
@@ -38,8 +41,17 @@ export interface LocalProxyDependencies {
    * @throws Error when the code is missing or malformed; the message is shown to the employee.
    */
   accessCode(): Promise<AccessCode>
+  /**
+   * The secret the DSH route currently presents; called once per request.
+   * @returns the expected `x-api-key` value.
+   */
+  secret(): Promise<string>
   /** Idle timeout of one relay response, in milliseconds. */
   readonly readTimeoutMs: number
+  /** Largest Messages request body read for rewriting, in bytes. */
+  readonly maxRequestBytes: number
+  /** Port to listen on first; `0`, or a port in use, falls back to an OS-assigned port. */
+  readonly preferredPort: number
 }
 
 function replyError(res: ServerResponse, status: number, type: string, message: string): void {
@@ -52,20 +64,75 @@ function replyError(res: ServerResponse, status: number, type: string, message: 
   res.end(body)
 }
 
-function sameSecret(presented: string | string[] | undefined, secret: Buffer): boolean {
+function sameSecret(presented: string | string[] | undefined, secret: string): boolean {
   if (typeof presented !== 'string') return false
   const bytes = Buffer.from(presented, 'utf8')
-  return bytes.length === secret.length && timingSafeEqual(bytes, secret)
+  const expected = Buffer.from(secret, 'utf8')
+  return bytes.length === expected.length && timingSafeEqual(bytes, expected)
 }
 
 /**
- * Start the loopback proxy on an OS-assigned port.
- * @param deps - access code source and timeouts.
+ * Read a request body up to a limit.
+ * @returns the body, or `undefined` when it exceeds `limit`.
+ */
+function readBody(req: IncomingMessage, limit: number): Promise<Buffer | undefined> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let done = false
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length
+      if (size > limit) {
+        req.removeAllListeners('data')
+        req.resume()
+        if (!done) resolve(undefined)
+        done = true
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.once('end', () => {
+      if (!done) resolve(Buffer.concat(chunks))
+      done = true
+    })
+    req.on('error', (error) => {
+      if (!done) reject(error)
+      done = true
+    })
+  })
+}
+
+/**
+ * Listen on the preferred loopback port, or on an OS-assigned one when it is `0` or taken.
+ * @returns the bound port.
+ */
+async function listen(server: Server, preferredPort: number): Promise<number> {
+  const attempt = (port: number): Promise<void> => new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, '127.0.0.1', () => {
+      server.off('error', reject)
+      resolve()
+    })
+  })
+  if (preferredPort !== 0) {
+    try { await attempt(preferredPort) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw error
+      // Another process holds the derived port; an OS-assigned port only costs the file cache across launches.
+      await attempt(0)
+    }
+  } else {
+    await attempt(0)
+  }
+  return (server.address() as AddressInfo).port
+}
+
+/**
+ * Start the loopback proxy.
+ * @param deps - access code and secret sources, limits, and the preferred port.
  * @returns the running proxy.
  */
 export async function startLocalProxy(deps: LocalProxyDependencies): Promise<LocalProxy> {
-  const secret = randomBytes(32).toString('base64url')
-  const secretBytes = Buffer.from(secret, 'utf8')
   const agents = new Map<string, Agent>()
   const open = new Set<{ destroy(): void }>()
 
@@ -80,7 +147,7 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
   }
 
   const handle = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (!sameSecret(req.headers['x-api-key'], secretBytes)) {
+    if (!sameSecret(req.headers['x-api-key'], await deps.secret())) {
       replyError(res, 401, 'authentication_error', 'keyhub local proxy: unknown caller')
       return
     }
@@ -91,11 +158,22 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
       replyError(res, 400, 'invalid_request_error', error instanceof Error ? error.message : String(error))
       return
     }
+    let body: Buffer | undefined
+    if (req.method === 'POST' && new URL(req.url ?? '/', 'http://proxy').pathname === MESSAGES_PATH) {
+      const raw = await readBody(req, deps.maxRequestBytes)
+      if (raw === undefined) {
+        replyError(res, 413, 'request_too_large', `请求体超过本机上限 ${deps.maxRequestBytes} 字节`)
+        return
+      }
+      body = stripDshExtensions(raw)
+    }
     const headers: OutgoingHttpHeaders = {}
     for (const [name, value] of Object.entries(req.headers)) {
       if (value !== undefined && !DROPPED_HEADERS.has(name)) headers[name] = value
     }
     headers['x-api-key'] = code.token
+    if (body !== undefined) headers['content-length'] = body.length
+    else if (req.headers['content-length'] !== undefined) headers['content-length'] = req.headers['content-length']
     const target = new URL(req.url ?? '/', code.relayURL)
     const upstream = (target.protocol === 'https:' ? httpsRequest : httpRequest)(target, {
       method: req.method, headers, agent: agentFor(code),
@@ -120,7 +198,8 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
     })
     upstream.once('close', () => { open.delete(upstream) })
     res.once('close', () => { if (!res.writableFinished) upstream.destroy() })
-    req.pipe(upstream)
+    if (body !== undefined) upstream.end(body)
+    else req.pipe(upstream)
   }
 
   const server: Server = createServer((req, res) => {
@@ -129,17 +208,9 @@ export async function startLocalProxy(deps: LocalProxyDependencies): Promise<Loc
     })
   })
   server.requestTimeout = 0
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', () => {
-      server.off('error', reject)
-      resolve()
-    })
-  })
-  const { port } = server.address() as AddressInfo
+  const port = await listen(server, deps.preferredPort)
   return {
     baseURL: `http://127.0.0.1:${port}/anthropic`,
-    secret,
     async close() {
       for (const exchange of open) exchange.destroy()
       const closed = new Promise<void>((resolve) => { server.close(() => { resolve() }) })

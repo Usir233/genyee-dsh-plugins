@@ -41,6 +41,10 @@ export interface EmployeeConfig {
   accessCodeRef: string
   /** Idle read timeout of one relay response; keep it above the admin's `upstreamReadTimeoutMs`. */
   relayReadTimeoutMs: number
+  /** Loopback port of the local proxy; `0` derives a stable port in 40000–49999 from the installation. */
+  localProxyPort: number
+  /** Largest Messages request body the local proxy reads to remove DSH extensions, in bytes. */
+  maxRequestBytes: number
 }
 
 /** Settings of one plugin row. */
@@ -71,6 +75,8 @@ const EmployeeConfigSchema: z<EmployeeConfig> = z.object({
   role: z.const('employee').required(),
   accessCodeRef: z.string().default('GENYEE_KEYHUB_ACCESS_CODE'),
   relayReadTimeoutMs: z.natural().min(MIN_UPSTREAM_READ_TIMEOUT_MS).default(MIN_UPSTREAM_READ_TIMEOUT_MS + 60_000),
+  localProxyPort: z.natural().max(65535).default(0),
+  maxRequestBytes: z.natural().min(1).default(64 * 1024 * 1024),
 })
 
 export const Config: z<Config> = z.union([AdminConfigSchema, EmployeeConfigSchema])

@@ -24,13 +24,15 @@
 | D8 | 员工端注册**自己的** DeepSeek 路由 `genyee-keyhub`，复用上游公开导出的 `registerDeepSeekProvider`；该路由把请求发给员工端插件在本机 `127.0.0.1` 开的中转端口，再由中转转发给管理端；不修改官方路由 `llm-deepseek-api-key` 的配置 | 员工端只需一个插件即可工作；上游适配器用全局 `fetch` 发请求，无法按请求核对证书，本机中转负责核对（D15） | 改写官方路由的 `baseURL` 和 `apiKeyEnv` |
 | D9 | 管理员自己使用 DSH 时，也走本机转发（回环地址），身份为自动创建的"管理员"员工条目 | 管理员的请求同样带 `user_id`、计入用量，两种模式行为对称 | 管理员直接用官方路由 |
 | D10 | 管理端转发时删除所有 `dsh_` 开头的请求体扩展字段和 `x-deepseek-harness-user-id` 请求头；组合包同时关闭插件清单（`plugin-package-inventory-deepseek`）和会话日志上传（`session-log-deepseek`） | 已核实：上游默认随每个模型请求向 DeepSeek 上传启用的插件包清单（`dsh_plugin_packages`）、**整个会话的事件日志**（`dsh_session_log`，含工具输出、文件内容、工作目录）和设备匿名 ID；企业场景不应外发这些非推理数据 | 原样透传 |
-| D11 | 以 `.tgz` 包分发，用 `dsh plugin --profile <name> add ./genyee-dsh-keyhub-<version>.tgz` 安装；`package.json` 声明精确的 `engines.dsh` 范围 | 客户内网不一定能访问 npm；`engines.dsh` 不兼容时启动器跳过该组合包，不会带病运行 | 公共 npm 发布 |
+| D11 | 以 `.tgz` 包分发，用 `dsh plugin --profile <name> add ./genyee-dsh-keyhub-<version>.tgz` 安装；`package.json` 声明 `engines.dsh` 版本区间（D18） | 客户内网不一定能访问 npm；`engines.dsh` 不兼容时启动器跳过该组合包，不会带病运行 | 公共 npm 发布 |
 | D12 | 同一个 DeepSeek 账号下给每个部门开一个 Key；管理端按员工所属部门选用 Key；并发不够时向官方申请扩容 | 一个部门的 Key 出问题只换这一个；同账号下所有 Key 共用一个余额和一份账单，部门预算由管理端执行（D13） | 每个部门一个 DeepSeek 账号 |
 | D13 | 额度按**金额**计，分**部门**和**员工**两级，请求须两级都有余额才放行；另按员工限制可用模型和并发数（§5.4） | 管理端是唯一出口，员工无法绕过；金额比 token 更贴近财务预算 | 只按 token 计；只设员工一级 |
-| D14 | 不再维护 fork 仓库 `DSH-GENYEE` 的同步；跟进上游的方式是用上游新版本测试插件，通过后更新 `engines.dsh` 并发布插件新版本 | 插件依赖上游已发布的 npm 包、运行在官方 DSH 中，交付不需要 fork | 定期同步 fork |
+| D14 | 不再维护 fork 仓库 `DSH-GENYEE` 的同步；跟进上游的方式是用 `pnpm test:compat` 测试区间内的新版本；DSH 进入新的次版本（如 0.3）时适配、放宽 `engines.dsh` 并发布插件新版本 | 插件依赖上游已发布的 npm 包、运行在官方 DSH 中，交付不需要 fork | 定期同步 fork |
 | D15 | 公司没有内部 CA：管理端使用自签证书；管理员发给员工的是**接入码**（管理端地址 + 证书 SHA-256 指纹 + 授权码）；员工端本机中转只接受指纹相符的证书，握手核对通过前不发送任何请求字节 | 员工无需安装证书或修改系统设置，Windows、macOS 相同；冒充管理端拿不到授权码 | 员工电脑安装证书；明文 HTTP |
 | D16 | 管理端以 HTTP 400 `invalid_request_error` 返回员工应看到的拒绝原因（额度、模型、授权码、部门 Key），`error.code` 给出机器可读原因；只有并发超限用 429 | 实测 DSH 界面把 401/403 显示为“API 密钥无效”、402 显示为“当前请求的额度已用尽”，丢掉管理端的具体原因；400 原样显示且不重试 | 401/402/403 |
 | D17 | 管理页面与员工设置使用 DSH Connection 的精确 Fetch 路由 `/api/genyee-keyhub/admin` 与 `/api/genyee-keyhub/employee`（只有本机 owner 可访问） | 上游 0.2.2-alpha.2 的 `connection.rpc.handle` 在 Connection 服务自己的上下文中读取 `webServer`，任何调用方都会失败（上游无生产调用方）；Fetch 路由不依赖它 | `connection.rpc.handle` 自定义通道 |
+| D18 | `engines.dsh` 用区间 `>=0.2.1-rc.1 <0.3.0`，`pnpm test:compat` 对区间内每个已发布 DSH 版本跑 headless 端到端测试 | npm 的 `latest`、`next` 标签是 0.2.1 rc，`alpha` 是 0.2.2；精确版本会让大多数员工的 DSH 跳过插件，且官方桌面端有强制更新，公司无法锁定版本 | 精确版本号，每次 DSH 升级都重新发布 |
+| D19 | 插件不改变 DSH 的会话日志与插件清单上传设置；Genyee 路由上由员工本机中转删除所有 `dsh_` 字段和设备 ID 请求头 | 之前的全局关闭也影响员工走自己 Key 的官方路由；本机删除让这些内容不离开员工电脑，且无需修改其他插件的配置 | 组合包全局关闭两项上传 |
 
 ## 3. 威胁模型
 

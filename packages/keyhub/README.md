@@ -38,7 +38,7 @@ Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。�
 
 ## 安装
 
-两种模式安装同一个包。组合包默认是员工模式，并把默认模型切换到 `genyee-keyhub` 路由；同时关闭插件清单和会话日志上传。桌面端可以在“插件 → 添加插件”中填入 `.tgz` 的绝对路径，也可以用命令行：
+两种模式安装同一个包。组合包默认是员工模式，并把默认模型切换到 `genyee-keyhub` 路由。桌面端可以在“插件 → 添加插件”中填入 `.tgz` 的绝对路径，也可以用命令行：
 
 ```sh
 dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
@@ -110,7 +110,31 @@ T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
 
 接入码保存在 DSH 凭据库中，引用名为 `GENYEE_KEYHUB_ACCESS_CODE`。headless 等没有凭据库的 profile 也可以用同名环境变量。
 
-员工端在本机 `127.0.0.1` 上开一个随机端口，DSH 的模型请求经它转发给管理端。连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
+员工端在本机 `127.0.0.1` 上开一个端口（本机中转），DSH 的模型请求经它转发给管理端：
+
+- **字段删除**：转发前删除请求体中所有 `dsh_` 开头的 DSH 扩展字段，以及设备匿名 ID 请求头。会话日志和插件清单不会离开员工电脑。
+- **证书核对**：连接管理端时核对接入码中的证书指纹，不符即拒绝，不发送授权码。
+- **端口与密钥固定**：端口由 DSH 数据目录推导，固定在 40000–49999 之间，被占用时改用随机端口；DSH 访问中转所用的密钥由接入码推导。因此重启后 DSH 的图片上传缓存仍然有效，更换接入码后缓存重新开始。
+
+## 会话日志和插件清单上传
+
+DSH 默认会在发往 DeepSeek 官方接口的请求中附带会话日志（`dsh_session_log`）和已启用插件清单（`dsh_plugin_packages`）。本插件**不改变**这两项设置，只保证 Genyee 路由上它们不会离开员工电脑（本机中转删除；管理端也会再删一次）。走员工自己 Key 的官方路由时，按 DSH 自身的开关处理：
+
+| 上传项 | 开关 | 生效 |
+|---|---|---|
+| 会话日志 | DSH 设置 → 通用设置 → “在使用官方模型 API 时上传 Session Log” | 立即 |
+| 插件清单 | profile 的 `cordis.patch.yml` 中加入下面的行 | 重启 DSH 后 |
+
+公司要在所有员工电脑上统一关闭两项上传时，把下面两行加入员工 profile 的 `cordis.patch.yml`：
+
+```yaml
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- id: session-log-deepseek
+  config:
+    enabled: false
+```
 
 ## 配置
 
@@ -132,6 +156,14 @@ T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
 | `lowBalanceYuan` | admin | `50` | 余额低于此值（元）时在服务状态页和日志中提醒 |
 | `accessCodeRef` | employee | `GENYEE_KEYHUB_ACCESS_CODE` | 存放接入码的凭据名 |
 | `relayReadTimeoutMs` | employee | `660000` | 等待管理端数据的上限，应大于管理端的 `upstreamReadTimeoutMs` |
+| `localProxyPort` | employee | `0` | 本机中转端口；`0` 表示由 DSH 数据目录推导出 40000–49999 中的固定端口 |
+| `maxRequestBytes` | employee | 64 MiB | 本机中转读取单个模型请求的上限 |
+
+## DSH 版本兼容
+
+`engines.dsh` 为 `>=0.2.1-rc.1 <0.3.0`：0.2.1 的各个 rc、0.2.2 的 alpha 以及之后的 0.2.x 都会加载本插件。DSH 判断时包含预发布版本。
+
+`pnpm test:compat` 列出 npm 上该范围内已发布的每个 `@deepseek-ai/dsh` 版本，逐个安装后跑一次 headless 端到端测试；DSH 发布新的 0.2.x 版本后运行它确认兼容。DSH 0.3 起需要重新适配，并在验证后放宽 `engines.dsh`。
 
 ## 测试
 
@@ -139,6 +171,7 @@ T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
 pnpm test         # 单元、转发、账本与管理接口测试，使用本地模拟的 DeepSeek
 pnpm test:e2e     # 构建后用 npm 上的 dsh CLI 加载本插件，跑一次 headless 任务（TLS + 指纹核对）
 pnpm test:real    # 用真实 DeepSeek API 测试转发（需要 DEEPSEEK_API_KEY 或仓库根目录 .env；会产生少量费用）
+pnpm test:compat  # 对 engines.dsh 范围内每个已发布的 DSH 版本跑一次 headless 端到端测试
 ```
 
 `pnpm build` 同时构建服务端（`lib/`）和浏览器端（`lib/client.js`，由 `scripts/build-client.mjs` 生成 DSH 客户端模块格式）。
@@ -147,6 +180,6 @@ pnpm test:real    # 用真实 DeepSeek API 测试转发（需要 DEEPSEEK_API_KE
 
 - 管理员的 DSH 必须开着，员工才能使用；管理端关闭时员工看到“无法连接管理端”。
 - 同一版本号的 `.tgz` 重新安装时，pnpm 会沿用已安装的内容；替换为同版本的新构建前先 `dsh plugin --profile <profile> remove @genyee/dsh-keyhub`。
-- 员工端本机中转的端口和密钥每次启动都会变，DSH 的图片上传缓存因此在重启后失效，会重新上传。
+- 本机中转推导出的端口被其他程序占用时改用随机端口，那次运行中上传的图片在下次启动后会重新上传一次。
 - 断开连接时的输出估算按实测的中文约 4.8 字节/token 取 4 字节/token，略高于实际。
 - DSH 在额度用尽（402）等情况下会在界面上替换掉服务端的提示文字，本插件因此用 400 返回拒绝原因（见“转发时做什么”）。

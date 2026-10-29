@@ -4,14 +4,17 @@ import type {} from '@deepseek-ai/dsh-client-connection'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import { launchEnvironmentOf } from '@deepseek-ai/dsh-launch-environment'
 import { catalogModelInfo, registerDeepSeekProvider, resolveAdapterOptions } from '@deepseek-ai/dsh-llm-deepseek'
+import { randomBytes } from 'node:crypto'
+import { homedir } from 'node:os'
 import type { AccessCode } from '../access-code.ts'
 import { decodeAccessCode } from '../access-code.ts'
 import type { EmployeeConfig } from '../config.ts'
-import type { EmployeeRpcDependencies } from './rpc.ts'
 import { rpcRoute } from '../rpc-route.ts'
-import { createEmployeeRpc, EMPLOYEE_ROUTE } from './rpc.ts'
+import { proxyPort, proxySecret } from './identity.ts'
 import type { LocalProxy } from './local-proxy.ts'
 import { startLocalProxy } from './local-proxy.ts'
+import type { EmployeeRpcDependencies } from './rpc.ts'
+import { createEmployeeRpc, EMPLOYEE_ROUTE } from './rpc.ts'
 
 /** Provider route id employees select. */
 export const PROVIDER = 'genyee-keyhub'
@@ -40,9 +43,23 @@ export async function applyEmployee(ctx: Context, config: EmployeeConfig): Promi
     return decodeAccessCode(value)
   }
 
+  // Requests without a usable access code fail in the proxy with the reason; until then any secret will do.
+  const launchSecret = randomBytes(32).toString('base64url')
+  const routeSecret = async (): Promise<string> => {
+    try { return proxySecret((await readAccessCode()).token) }
+    catch (_noAccessCode) { return launchSecret }
+  }
+  const installation = `${launchEnvironmentOf(ctx).get('DSH_HOME')?.value ?? homedir()}\0${config.accessCodeRef}`
+
   let proxy: LocalProxy | undefined
   await ctx.effect(async () => {
-    proxy = await startLocalProxy({ accessCode: readAccessCode, readTimeoutMs: config.relayReadTimeoutMs })
+    proxy = await startLocalProxy({
+      accessCode: readAccessCode,
+      secret: routeSecret,
+      readTimeoutMs: config.relayReadTimeoutMs,
+      maxRequestBytes: config.maxRequestBytes,
+      preferredPort: config.localProxyPort === 0 ? proxyPort(installation) : config.localProxyPort,
+    })
     const running = proxy
     return async () => { await running.close() }
   }, 'keyhub.localProxy')
@@ -51,7 +68,7 @@ export async function applyEmployee(ctx: Context, config: EmployeeConfig): Promi
   const relayStatus: EmployeeRpcDependencies['relayStatus'] = async () => {
     const running = proxy!
     const response = await fetch(new URL('/keyhub/v1/status', running.baseURL), {
-      headers: { 'x-api-key': running.secret },
+      headers: { 'x-api-key': await routeSecret() },
       signal: AbortSignal.timeout(STATUS_TIMEOUT_MS),
     })
     const body = await response.json() as Record<string, unknown>
@@ -64,7 +81,7 @@ export async function applyEmployee(ctx: Context, config: EmployeeConfig): Promi
   registerDeepSeekProvider(ctx, PROVIDER, {
     providerName: 'Genyee',
     options,
-    resolveAuth: async () => ({ headers: { 'x-api-key': proxy!.secret } }),
+    resolveAuth: async () => ({ headers: { 'x-api-key': await routeSecret() } }),
     async discoverModels(provider) {
       const catalog = options().models
       let allowed: readonly string[] | undefined

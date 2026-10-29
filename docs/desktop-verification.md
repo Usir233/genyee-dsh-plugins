@@ -1,6 +1,6 @@
 # 桌面端验证清单（两台电脑，Windows / macOS）
 
-本清单在两台同一内网的真实电脑上验证 `@genyee/dsh-keyhub` 0.2.0：一台做**管理员**，一台做**员工**。单机上的同类验证已在开发时完成：两个独立数据目录的 DSH Web 实例、一个从源码运行的桌面端，以及真实 DeepSeek API。这里要确认的是跨机器网络、防火墙，以及正式发布版桌面端。
+本清单在两台同一内网的真实电脑上验证 `@genyee/dsh-keyhub` 0.2.1：一台做**管理员**，一台做**员工**。单机上的同类验证已在开发时完成：两个独立数据目录的 DSH Web 实例、一个从源码运行的桌面端，以及真实 DeepSeek API。这里要确认的是跨机器网络、防火墙，以及正式发布版桌面端。
 
 每一步后面的 **【记录】** 是需要发回的内容。遇到和描述不一致的情况，停下来，把截图和报错原文发回即可。
 
@@ -8,8 +8,8 @@
 
 | 项目 | 管理员电脑 | 员工电脑 |
 |---|---|---|
-| DSH 桌面端 | `0.2.2-alpha.2` | `0.2.2-alpha.2` |
-| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.0.tgz` | 同左 |
+| DSH 桌面端 | 0.2.x，从 `0.2.1-rc.1` 起 | 同左 |
+| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.1.tgz` | 同左 |
 | DeepSeek Key | 一个测试用 Key，账户里留少量余额 | 不需要 |
 
 下文用 `<DSH>` 表示 DSH 的数据目录：macOS 为 `~/.dsh`，Windows 为 `%USERPROFILE%\.dsh`。在 YAML 文件里写 Windows 路径时用正斜杠，例如 `C:/Users/张三/keyhub/relay.crt`。

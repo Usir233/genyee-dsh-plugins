@@ -21,7 +21,8 @@ import { startMockDeepSeek, streamReply } from '../support/mock-deepseek.ts'
 
 const run = promisify(execFile)
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-const dsh = join(packageDir, 'node_modules/.bin/dsh')
+// `KEYHUB_DSH_BIN` selects another installed dsh CLI; `pnpm test:compat` runs this file once per supported release.
+const dsh = process.env.KEYHUB_DSH_BIN ?? join(packageDir, 'node_modules/.bin/dsh')
 
 async function freePort(): Promise<number> {
   const server = createServer()

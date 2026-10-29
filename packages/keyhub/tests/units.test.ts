@@ -3,6 +3,7 @@ import { decodeAccessCode, encodeAccessCode, generateToken, normalizeFingerprint
 import { assertTimeZone, formatYuan, parsePrice, parseYuan, periodStart, requestCostMicros } from '../src/admin/money.ts'
 import { rewriteMessagesBody } from '../src/admin/rewrite.ts'
 import { jsonUsageTap, streamUsageTap } from '../src/admin/usage.ts'
+import { stripDshExtensions } from '../src/dsh-extensions.ts'
 
 const FINGERPRINT = 'ab'.repeat(32)
 
@@ -129,5 +130,15 @@ describe('usage taps', () => {
     const large = jsonUsageTap(4)
     large.push(Buffer.from('{"usage":{}}'))
     expect(large.finish()).toBeUndefined()
+  })
+})
+
+describe('stripDshExtensions', () => {
+  it('removes only dsh_ fields and leaves other bodies untouched', () => {
+    expect(JSON.parse(stripDshExtensions(Buffer.from('{"model":"m","dsh_session_log":{},"dshx":1}')).toString())).toEqual({ model: 'm', dshx: 1 })
+    const plain = Buffer.from('{"model":"m"}')
+    expect(stripDshExtensions(plain)).toBe(plain)
+    const broken = Buffer.from('{not json')
+    expect(stripDshExtensions(broken)).toBe(broken)
   })
 })

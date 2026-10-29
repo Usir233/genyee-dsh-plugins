@@ -1,6 +1,6 @@
 # Employee defaults: every installation starts in the employee role and selects
-# the genyee-keyhub route. The admin installation overrides the genyee-keyhub
-# row in its profile patch with role: admin and the relay settings.
+# the genyee-keyhub route. An admin installation adds its own admin row in its
+# profile patch; this employee row stays, so the admin's own chats use the relay.
 - insert:
     - id: genyee-keyhub
       name: '@genyee/dsh-keyhub'
@@ -11,12 +11,3 @@
   config:
     provider: genyee-keyhub
     model: deepseek-flash
-
-# The relay strips every dsh_ body extension; turning the contributors off keeps
-# them from being prepared at all.
-- id: plugin-package-inventory-deepseek
-  disabled: true
-
-- id: session-log-deepseek
-  config:
-    enabled: false

@@ -12,6 +12,7 @@
 - [员工：开始使用](#员工开始使用)
 - [日常管理](#日常管理)
 - [常见提示与处理](#常见提示与处理)
+- [DSH 版本与隐私设置](#dsh-版本与隐私设置)
 - [升级、备份与迁移](#升级备份与迁移)
 - [命令行工具](#命令行工具)
 - [开发者](#开发者)
@@ -31,8 +32,8 @@
 
 | 项目 | 管理员电脑 | 员工电脑 |
 |---|---|---|
-| DSH 桌面端 | `0.2.2-alpha.2` | `0.2.2-alpha.2` |
-| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.0.tgz` | 同左 |
+| DSH 桌面端 | 0.2.x，从 `0.2.1-rc.1` 起 | 同左 |
+| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.1.tgz` | 同左 |
 | Node.js 24 以上 | 需要（生成证书时用一次） | 不需要 |
 | DeepSeek Key | 公司账号下每个部门一个 | 不需要 |
 | 网络 | 一个固定的内网 IP，员工能访问它的 8443 端口 | 能访问管理员电脑 |
@@ -144,9 +145,29 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 | 服务状态显示“没有已配置 Key 的启用部门” | 没有启用的部门设置了 Key，或 DSH 刚启动 | 设置部门 Key；刚启动时 1 分钟内会自动重试 |
 | 员工电脑连不上 | 防火墙拦截 8443 端口 | 在系统防火墙中允许 DSH 接受连接 |
 
+## DSH 版本与隐私设置
+
+**DSH 版本**：插件支持 DSH `0.2.1-rc.1` 起的所有 0.2.x 版本（包括正式版、rc 和 alpha）。DSH 在 0.2.x 内升级时不用更换插件。DSH 升到 0.3 后，需要等插件发布新版本才能继续使用 Genyee 路由；此时插件会被 DSH 跳过，员工看不到 Genyee 模型。
+
+**会话日志和插件清单**：DSH 默认会随发往 DeepSeek 官方接口的请求上传会话日志和已启用插件清单。走 Genyee 路由时，这两项在员工电脑上就被删除，不会经过管理员电脑，也不会到达 DeepSeek。员工用自己的 Key 走官方路由时，按 DSH 自己的开关处理：
+
+- 会话日志：设置 → 通用设置 → “在使用官方模型 API 时上传 Session Log”，立即生效。
+- 插件清单：没有界面开关，需要在 `cordis.patch.yml` 中关闭，重启后生效。
+
+公司要统一关闭这两项上传，在每台员工电脑的 `<DSH>/profiles/desktop/cordis.patch.yml` 末尾加入：
+
+```yaml
+- id: plugin-package-inventory-deepseek
+  disabled: true
+
+- id: session-log-deepseek
+  config:
+    enabled: false
+```
+
 ## 升级、备份与迁移
 
-**升级插件**：在插件页卸载旧版本后安装新版本的 `.tgz`。同一版本号的包重新安装不会替换文件，必须先卸载。账本会自动升级格式；降级到旧版本的插件不能读取新格式的账本。
+**升级插件**：在插件页卸载旧版本后安装新版本的 `.tgz`，例如从 0.2.0 升到 0.2.1。同一版本号的包重新安装不会替换文件，必须先卸载。账本会自动升级格式；降级到旧版本的插件不能读取新格式的账本。
 
 **备份**：定期备份以下三类文件。
 
@@ -183,6 +204,7 @@ pnpm run build        # 构建服务端和浏览器端，输出到 lib/
 pnpm test             # 单元、转发、账本和管理接口测试（模拟 DeepSeek）
 pnpm run test:e2e     # 用 npm 上的 dsh CLI 加载插件，跑一次 headless 任务
 pnpm run test:real    # 用真实 DeepSeek API 测试，需要 DEEPSEEK_API_KEY 或仓库根目录的 .env，会产生少量费用
+pnpm run test:compat  # 对支持范围内每个已发布的 DSH 版本跑一次 headless 端到端测试
 pnpm pack --pack-destination ../../releases/keyhub   # 生成安装包
 ```
 

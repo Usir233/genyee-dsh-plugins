@@ -2,7 +2,7 @@
  * Settings-section commands of the employee role, served on {@link EMPLOYEE_ROUTE}: save or clear the access code and
  * report the connection to the admin relay. Only the owner of this DSH reaches the route (see `src/rpc-route.ts`).
  */
-import { decodeAccessCode } from '../access-code.ts'
+import { applyRelayUpdate, decodeAccessCode, isRelayUpdate } from '../access-code.ts'
 import type { RpcAnswer, RpcHandler } from '../rpc-route.ts'
 
 /** Connection API route of the employee settings section. */
@@ -80,8 +80,16 @@ export function createEmployeeRpc(deps: EmployeeRpcDependencies): RpcHandler {
         case 'accessCode.save': {
           const code = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>).code : undefined
           if (typeof code !== 'string' || code.trim().length === 0) return failure('keyhub/invalid', '请粘贴管理员提供的接入码')
-          decodeAccessCode(code)
-          await deps.save(code.trim())
+          let next: string
+          if (isRelayUpdate(code)) {
+            const existing = await deps.readRaw()
+            if (existing === undefined) return failure('keyhub/invalid', '尚未保存个人接入码，无法单独更新连接地址；请先粘贴完整的 gkh1. 接入码')
+            next = applyRelayUpdate(existing, code)
+          } else {
+            decodeAccessCode(code)
+            next = code.trim()
+          }
+          await deps.save(next)
           return { ok: true, value: await connection() }
         }
         case 'accessCode.clear':

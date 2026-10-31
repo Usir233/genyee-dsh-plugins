@@ -30,8 +30,8 @@ export interface LedgerRelayOptions {
 /** A ledger relay with its in-flight re-check. */
 export interface LedgerRelay {
   readonly relay: Relay<LedgerAdmission>
-  /** Abort in-flight requests whose employee was disabled, got a new token, or changed department. */
-  recheck(): void
+  /** Abort in-flight requests whose employee was disabled, expired, got a new token, or changed department. */
+  recheck(now?: number): void
 }
 
 /**
@@ -63,7 +63,7 @@ export function createLedgerRelay(ledger: KeyhubStore, options: LedgerRelayOptio
     status: admission => employeeStatus(ledger, admission, Date.now(), options.defaultMaxConcurrency, PLUGIN_VERSION),
     files: {
       record: (fileId, admission) => { ledger.recordFile(fileId, admission.employee.userId, admission.department.id, Date.now()) },
-      owner: fileId => ledger.fileOwner(fileId),
+      owns: (fileId, admission) => ledger.fileOwns(fileId, admission.employee.userId, admission.department.id),
       forget: (fileId) => { ledger.forgetFile(fileId) },
     },
     upstreamBaseURL: options.upstreamBaseURL,
@@ -91,9 +91,9 @@ export function createLedgerRelay(ledger: KeyhubStore, options: LedgerRelayOptio
   })
   return {
     relay,
-    recheck() {
+    recheck(now = Date.now()) {
       relay.interrupt(({ employee, department }) => {
-        const current = ledger.readmit(employee.userId)
+        const current = ledger.readmit(employee.userId, now)
         return current !== undefined && current.employee.tokenSha256 === employee.tokenSha256 && current.department.id === department.id
       })
     },

@@ -1,7 +1,7 @@
 {
   "name": "@genyee/dsh-keyhub",
   "description": "Genyee 密钥中心：管理员 DSH 集中保管 DeepSeek Key、按员工强制写入 user_id 并执行金额额度",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "type": "module",
   "main": "lib/index.js",

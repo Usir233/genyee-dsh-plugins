@@ -21,15 +21,26 @@ const DROPPED_RESPONSE_HEADERS = new Set([
 
 /** Outcome of rewriting one Messages request body. */
 export type BodyRewrite =
-  | { readonly ok: true, readonly body: Buffer, readonly model: string | undefined, readonly maxTokens: number | undefined }
+  | { readonly ok: true, readonly body: Buffer, readonly model: string | undefined, readonly maxTokens: number | undefined, readonly fileIds: readonly string[] }
   | { readonly ok: false, readonly reason: string }
+
+function collectFileIds(value: unknown, out: Set<string>): void {
+  if (typeof value !== 'object' || value === null) return
+  if (Array.isArray(value)) {
+    for (const item of value) collectFileIds(item, out)
+    return
+  }
+  const record = value as Record<string, unknown>
+  if (typeof record.file_id === 'string' && record.file_id.length > 0) out.add(record.file_id)
+  for (const child of Object.values(record)) collectFileIds(child, out)
+}
 
 /**
  * Bind a Messages request to one employee.
  * Overwrites `metadata.user_id`, keeps the other `metadata` fields, and removes every DSH body extension field.
  * @param raw - the request body the employee sent.
  * @param userId - the employee's DeepSeek `user_id`.
- * @returns the rewritten JSON body with its `model` and `max_tokens`, or the reason the body is not a JSON object.
+ * @returns the rewritten JSON body with its `model`, `max_tokens`, and referenced `fileIds`, or the reason the body is not a JSON object.
  */
 export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
   let parsed: unknown
@@ -42,11 +53,16 @@ export function rewriteMessagesBody(raw: Buffer, userId: string): BodyRewrite {
     : {}
   body.metadata = { ...metadata, user_id: userId }
   removeDshExtensions(body)
+  const fileIds = new Set<string>()
+  collectFileIds(body.messages, fileIds)
+  collectFileIds(body.system, fileIds)
+  collectFileIds(body.container, fileIds)
   return {
     ok: true,
     body: Buffer.from(JSON.stringify(body), 'utf8'),
     model: typeof body.model === 'string' ? body.model : undefined,
     maxTokens: typeof body.max_tokens === 'number' && Number.isSafeInteger(body.max_tokens) && body.max_tokens > 0 ? body.max_tokens : undefined,
+    fileIds: [...fileIds],
   }
 }
 

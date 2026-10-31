@@ -6,12 +6,12 @@ Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。�
 
 - **管理页面**（只在管理员的 DSH 中出现）：左侧栏“Genyee 密钥中心”。六个标签：
   - **部门**：新增、停用部门，设置部门 Key。
-  - **员工**：新增、停用、调整部门、限制可用模型和并发、重置接入码。接入码只显示一次。
+  - **员工**：新增、停用、修改姓名、调整部门、设置授权到期时间、限制可用模型和并发、按部门/关键词筛选、查看最近来源 IP（含 24h 多 IP 提醒）、重置接入码。接入码只显示一次。
   - **额度**：部门和员工两级额度，以及临时追加。
-  - **价格**：按模型维护价格，可删除。
+  - **价格**：按模型维护价格，支持一键填入常用模型参考价，可删除。
   - **用量**：按日期查看部门和员工的金额与 token，导出 CSV。
-  - **服务状态**：转发地址、证书指纹、账号余额。
-- **员工设置**（每个安装了本插件的 DSH 都有）：设置 → Genyee 密钥中心。在这里粘贴接入码，查看连接状态、可用模型和剩余额度。
+  - **服务状态**：转发地址、证书指纹、连接更新码（`gkhu1.`，换 IP / 证书时群发免重置员工 token）、账号余额。
+- **员工设置**（每个安装了本插件的 DSH 都有）：设置 → Genyee 密钥中心。在这里粘贴接入码（`gkh1.`）或连接更新码（`gkhu1.`），查看连接状态、可用模型、剩余额度和有效期。
 
 管理页面和员工设置通过 DSH 的 `/api/genyee-keyhub/admin` 与 `/api/genyee-keyhub/employee` 两个接口工作。DSH 只允许本机用户本人（owner）访问这两个接口；员工能访问的只有转发服务。
 
@@ -19,12 +19,13 @@ Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。�
 
 每个发往 `/anthropic/v1/messages` 的请求，管理端依次：
 
-1. **校验授权码**：用请求头 `x-api-key` 中的授权码查账本。授权码未知、员工停用或部门停用时拒绝，请求不发往 DeepSeek。
+1. **校验授权码**：用请求头 `x-api-key` 中的授权码查账本。授权码未知、已过期、员工停用或部门停用时拒绝，请求不发往 DeepSeek。
 2. **检查限制**，任一项不满足即拒绝：
+   - 请求体中引用的 `file_id` 均属于该员工在当前部门下上传的文件；
    - 模型在员工的可用列表内；
    - 该模型已设置价格；
    - 员工同时进行的请求数未超上限；
-   - 员工额度和部门额度都有余额。“已用”包括进行中的请求按 `max_tokens` 预留的金额，多个并发请求不能一起冲破额度。
+   - 员工额度和部门额度都有余额。“已用”包括进行中的请求按 `max_tokens`（未传时默认按 4,096 输出 token）预留的金额，多个并发请求不能一起冲破额度。
 3. **改写请求体**：把 `metadata.user_id` 设为该员工的 `userId`，覆盖员工端传来的值；删除所有 `dsh_` 开头的 DSH 扩展字段，包括插件清单 `dsh_plugin_packages` 和会话日志 `dsh_session_log`。
 4. **改写请求头**：把 `x-api-key` 换成该员工所属部门的 Key，删除 `x-deepseek-harness-user-id`（设备匿名 ID）。
 5. **流式转发**：原样转发响应，包括 DeepSeek 排队时的 `: keep-alive` 注释。没有数据时最多等待 600 秒。
@@ -32,9 +33,9 @@ Genyee 密钥中心：一个 DSH 插件，分管理员和员工两种模式。�
 
 **拒绝时员工看到什么**：拒绝原因以 HTTP 400 `invalid_request_error` 返回，`error.code` 是机器可读的原因（如 `keyhub_quota_exhausted`、`keyhub_model_not_allowed`、`keyhub_unauthorized`）。DSH 会把 401、402、403 换成自己的通用提示（如“API 密钥无效”），而 400 会原样显示管理端写的中文原因。并发超限是唯一的例外，返回 429，DSH 会自动重试。
 
-**变更生效时间**：账本变化（包括命令行工具在 DSH 运行期间的写入）约 1 秒内生效。员工被停用、重置授权码或调整部门时，进行中的请求立即中断。
+**变更生效时间**：账本变化（包括命令行工具在 DSH 运行期间的写入）约 1 秒内生效。员工被停用、授权码到期、重置授权码或调整部门时，进行中的请求立即中断。
 
-**Files API**：DSH 上传图片时使用 `/anthropic/v1/files`。管理端记录每个文件的上传者：列表只返回本人的文件，读取或删除他人的文件返回 404。上传同样受额度限制，没有声明长度的上传也按累计字节执行大小上限。
+**Files API**：DSH 上传图片时使用 `/anthropic/v1/files`。管理端按（员工、所属部门）记录每个文件的上传者：列表只返回本人在当前部门上传的文件，读取、删除或在 `/anthropic/v1/messages` 中引用他人的文件（或调岗前旧部门的文件）均被拒绝。上传同样受额度限制，没有声明长度的上传也按累计字节执行大小上限。
 
 ## 安装
 
@@ -86,13 +87,15 @@ dsh plugin --profile <profile> add ./genyee-dsh-keyhub-<version>.tgz
 
 ```sh
 T department --db DB --id rd --name 研发部 --key-ref GENYEE_DEEPSEEK_KEY_RD
+T price --db DB --defaults
 T price --db DB --model deepseek-flash --hit 0.2 --miss 2 --output 3
-T employee-add --db DB --name 张三 --department rd --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
+T employee-add --db DB --name 张三 --department rd --expires 2026-12-31 --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
 T quota --db DB --department rd --amount 5000 --period month
 T top-up --db DB --employee emp_xxx --amount 50 --note 项目加急
-T employee --db DB --user emp_xxx --models deepseek-flash --max-concurrency 4
+T employee --db DB --user emp_xxx --name 张三 --models deepseek-flash --max-concurrency 4 --expires 2027-06-30
 T employee --db DB --user emp_xxx --disable
 T employee --db DB --user emp_xxx --reset-token --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
+T relay-code --relay https://10.0.0.8:8443 --cert ~/.genyee-keyhub/relay.crt
 T report --db DB
 T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
 ```

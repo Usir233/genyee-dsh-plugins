@@ -29,9 +29,12 @@ export interface EmployeeView {
   readonly enabled: boolean
   readonly models: readonly string[] | undefined
   readonly maxConcurrency: number | undefined
+  readonly expiresAt: number | undefined
   readonly quota: QuotaView | undefined
   readonly monthSpentMicros: number
   readonly monthRequests: number
+  readonly lastClientAddress: string | undefined
+  readonly recentClientAddresses: readonly string[]
 }
 
 /** Prices in 元 per million tokens. */
@@ -57,6 +60,7 @@ export type BalanceReading =
 export interface ServiceInfo {
   readonly relayURL: string
   readonly fingerprint: string | undefined
+  readonly relayUpdateCode?: string
   readonly upstreamBaseURL: string
   readonly timeZone: string
   readonly defaultMaxConcurrency: number
@@ -105,6 +109,7 @@ export interface EmployeeStatus {
   readonly models: readonly string[]
   readonly maxConcurrency: number
   readonly quota: { readonly employee?: QuotaView, readonly department?: QuotaView }
+  readonly expiresAt?: number
   readonly relayVersion: string
 }
 

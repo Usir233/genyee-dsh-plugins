@@ -205,17 +205,33 @@ function DepartmentsTab({ t, state, mutate }: Mutations) {
   )
 }
 
+/** Local calendar date `YYYY-MM-DD` of an instant. */
+function isoDate(at: Date): string {
+  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')}`
+}
+
+function parseExpiryDate(date: string): number | null {
+  const trimmed = date.trim()
+  return trimmed === '' ? null : new Date(`${trimmed}T23:59:59.999`).getTime()
+}
+
 function EmployeeEditor({ t, state, employee, mutate, onDone }: Mutations & { employee: EmployeeView, onDone(): void }) {
+  const [name, setName] = useState(employee.name)
   const [departmentId, setDepartmentId] = useState(employee.departmentId)
   const [allModels, setAllModels] = useState(employee.models === undefined)
   const [models, setModels] = useState<string[]>([...employee.models ?? []])
   const [concurrency, setConcurrency] = useState(employee.maxConcurrency === undefined ? '' : String(employee.maxConcurrency))
+  const [expires, setExpires] = useState(employee.expiresAt === undefined ? '' : isoDate(new Date(employee.expiresAt)))
   const save = (): void => {
     const limit = concurrency.trim() === '' ? null : Number(concurrency)
-    void mutate('employee.update', { userId: employee.userId, departmentId, models: allModels ? null : models, maxConcurrency: limit }).then((ok) => { if (ok) onDone() })
+    const expiresAt = parseExpiryDate(expires)
+    void mutate('employee.update', { userId: employee.userId, name, departmentId, models: allModels ? null : models, maxConcurrency: limit, expiresAt }).then((ok) => { if (ok) onDone() })
   }
   return (
     <div className="gk-form">
+      <Field label={t('employee.name')}>
+        <input className="gk-input" value={name} onChange={(event) => { setName(event.target.value) }} />
+      </Field>
       <Field label={t('employee.department')}>
         <select className="gk-select" value={departmentId} onChange={(event) => { setDepartmentId(event.target.value) }}>
           {state.departments.map(department => <option key={department.id} value={department.id}>{department.name}</option>)}
@@ -235,7 +251,10 @@ function EmployeeEditor({ t, state, employee, mutate, onDone }: Mutations & { em
       <Field label={t('employee.concurrency')}>
         <input className="gk-input" inputMode="numeric" value={concurrency} placeholder={t('employee.concurrencyDefault', { n: state.service.defaultMaxConcurrency })} onChange={(event) => { setConcurrency(event.target.value) }} />
       </Field>
-      <button type="button" className="gk-button gk-primary" onClick={save}>{t('common.save')}</button>
+      <Field label={t('employee.expires')}>
+        <input className="gk-input" type="date" value={expires} onChange={(event) => { setExpires(event.target.value) }} />
+      </Field>
+      <button type="button" className="gk-button gk-primary" disabled={name.trim().length === 0} onClick={save}>{t('common.save')}</button>
       <button type="button" className="gk-button" onClick={onDone}>{t('common.cancel')}</button>
     </div>
   )
@@ -245,9 +264,24 @@ function EmployeesTab(props: Mutations) {
   const { t, state, mutate, issue } = props
   const [name, setName] = useState('')
   const [departmentId, setDepartmentId] = useState(state.departments[0]?.id ?? '')
+  const [expires, setExpires] = useState('')
+  const [filterDepartment, setFilterDepartment] = useState('')
+  const [search, setSearch] = useState('')
   const [editing, setEditing] = useState<string | undefined>()
   const departments = useMemo(() => new Map(state.departments.map(department => [department.id, department.name])), [state.departments])
-  const rows = state.employees.map((employee: EmployeeView) => [
+  const filtered = useMemo(() => {
+    const keyword = search.trim().toLowerCase()
+    return state.employees.filter((employee) => {
+      if (filterDepartment !== '' && employee.departmentId !== filterDepartment) return false
+      if (keyword === '') return true
+      return employee.name.toLowerCase().includes(keyword)
+        || employee.userId.toLowerCase().includes(keyword)
+        || (employee.lastClientAddress ?? '').toLowerCase().includes(keyword)
+        || employee.recentClientAddresses.some(addr => addr.toLowerCase().includes(keyword))
+    })
+  }, [state.employees, filterDepartment, search])
+  const now = Date.now()
+  const rows = filtered.map((employee: EmployeeView) => [
     employee.name,
     departments.get(employee.departmentId) ?? employee.departmentId,
     <span className="gk-mono">{employee.userId}</span>,
@@ -255,6 +289,23 @@ function EmployeesTab(props: Mutations) {
     t('employee.monthValue', { count: employee.monthRequests, cost: yuan(employee.monthSpentMicros) }),
     employee.models === undefined ? t('common.all') : employee.models.join(', ') || '—',
     employee.maxConcurrency === undefined ? t('employee.concurrencyDefault', { n: state.service.defaultMaxConcurrency }) : String(employee.maxConcurrency),
+    employee.expiresAt === undefined
+      ? t('employee.neverExpires')
+      : now >= employee.expiresAt
+        ? <span className="gk-tag gk-bad">{t('employee.expired', { date: isoDate(new Date(employee.expiresAt)) })}</span>
+        : isoDate(new Date(employee.expiresAt)),
+    employee.lastClientAddress === undefined
+      ? '—'
+      : (
+          <span className="gk-actions">
+            <span className="gk-mono">{employee.lastClientAddress}</span>
+            {employee.recentClientAddresses.length > 1 && (
+              <span className="gk-tag gk-bad" title={employee.recentClientAddresses.join(', ')}>
+                {t('employee.multiIp', { n: employee.recentClientAddresses.length })}
+              </span>
+            )}
+          </span>
+        ),
     <StatusTag t={t} enabled={employee.enabled} />,
     <span className="gk-actions">
       <button type="button" className="gk-button gk-small" onClick={() => { setEditing(employee.userId) }}>{t('common.edit')}</button>
@@ -266,8 +317,19 @@ function EmployeesTab(props: Mutations) {
   return (
     <>
       <div className="gk-card">
+        <div className="gk-form" style={{ marginBottom: 12 }}>
+          <Field label={t('employee.filterDepartment')}>
+            <select className="gk-select" value={filterDepartment} onChange={(event) => { setFilterDepartment(event.target.value) }}>
+              <option value="">{t('common.all')}</option>
+              {state.departments.map(department => <option key={department.id} value={department.id}>{department.name}</option>)}
+            </select>
+          </Field>
+          <Field label={t('employee.search')}>
+            <input className="gk-input" value={search} placeholder={t('employee.searchPlaceholder')} onChange={(event) => { setSearch(event.target.value) }} />
+          </Field>
+        </div>
         <Table
-          head={[t('employee.name'), t('employee.department'), t('employee.userId'), t('employee.quota'), t('employee.month'), t('employee.models'), t('employee.concurrency'), t('employee.status'), t('common.actions')]}
+          head={[t('employee.name'), t('employee.department'), t('employee.userId'), t('employee.quota'), t('employee.month'), t('employee.models'), t('employee.concurrency'), t('employee.expires'), t('employee.ip'), t('employee.status'), t('common.actions')]}
           rows={rows}
           empty={t('common.none')}
         />
@@ -280,12 +342,15 @@ function EmployeesTab(props: Mutations) {
       )}
       <div className="gk-card">
         <h3>{t('employee.add')}</h3>
-        <form className="gk-form" onSubmit={(event) => { event.preventDefault(); void issue('employee.add', { name, departmentId }, name).then((ok) => { if (ok) setName('') }) }}>
+        <form className="gk-form" onSubmit={(event) => { event.preventDefault(); const expiresAt = parseExpiryDate(expires); void issue('employee.add', { name, departmentId, ...expiresAt === null ? {} : { expiresAt } }, name).then((ok) => { if (ok) { setName(''); setExpires('') } }) }}>
           <Field label={t('employee.name')}><input className="gk-input" value={name} onChange={(event) => { setName(event.target.value) }} /></Field>
           <Field label={t('employee.department')}>
             <select className="gk-select" value={departmentId} onChange={(event) => { setDepartmentId(event.target.value) }}>
               {state.departments.map(department => <option key={department.id} value={department.id}>{department.name}</option>)}
             </select>
+          </Field>
+          <Field label={t('employee.expires')}>
+            <input className="gk-input" type="date" value={expires} onChange={(event) => { setExpires(event.target.value) }} />
           </Field>
           <button type="submit" className="gk-button gk-primary" disabled={name.trim().length === 0 || departmentId === ''}>{t('common.add')}</button>
         </form>
@@ -399,15 +464,11 @@ function PricesTab({ t, state, mutate }: Mutations) {
           <Field label={t('price.miss')}><input className="gk-input" inputMode="decimal" value={miss} onChange={(event) => { setMiss(event.target.value) }} /></Field>
           <Field label={t('price.output')}><input className="gk-input" inputMode="decimal" value={output} onChange={(event) => { setOutput(event.target.value) }} /></Field>
           <button type="submit" className="gk-button gk-primary" disabled={[model, hit, miss, output].some(value => value.trim() === '')}>{t('common.save')}</button>
+          <button type="button" className="gk-button" onClick={() => { void mutate('price.defaults', {}) }}>{t('price.fillDefaults')}</button>
         </form>
       </div>
     </>
   )
-}
-
-/** Local calendar date `YYYY-MM-DD` of an instant. */
-function isoDate(at: Date): string {
-  return `${at.getFullYear()}-${String(at.getMonth() + 1).padStart(2, '0')}-${String(at.getDate()).padStart(2, '0')}`
 }
 
 /** Range from the start of `from` to the end of `to`, both local calendar dates. */
@@ -485,9 +546,16 @@ function UsageTab({ t, state, call, onError }: Mutations & { onError(message: st
 
 function ServiceTab({ t, state, call }: Mutations) {
   const [balance, setBalance] = useState(state.balance)
+  const [copiedUpdate, setCopiedUpdate] = useState(false)
   useEffect(() => { setBalance(state.balance) }, [state.balance])
   const refresh = async (): Promise<void> => { setBalance(await call<ManagementState['balance']>('balance.refresh')) }
   const { service } = state
+  const copyUpdateCode = async (): Promise<void> => {
+    if (service.relayUpdateCode === undefined) return
+    await navigator.clipboard.writeText(service.relayUpdateCode)
+    setCopiedUpdate(true)
+    setTimeout(() => { setCopiedUpdate(false) }, 2000)
+  }
   let balanceText: ReactNode
   switch (balance.state) {
     case 'unknown': balanceText = t('service.balanceUnknown'); break
@@ -508,6 +576,18 @@ function ServiceTab({ t, state, call }: Mutations) {
       <dl className="gk-kv">
         <dt>{t('service.relay')}</dt><dd className="gk-mono">{service.relayURL}</dd>
         <dt>{t('service.fingerprint')}</dt><dd className="gk-mono">{service.fingerprint ?? t('service.plainHttp')}</dd>
+        {service.relayUpdateCode !== undefined && (
+          <>
+            <dt>{t('service.updateCode')}</dt>
+            <dd>
+              <span className="gk-actions">
+                <span className="gk-mono">{service.relayUpdateCode}</span>
+                <button type="button" className="gk-button gk-small" onClick={() => { void copyUpdateCode() }}>{t(copiedUpdate ? 'code.copied' : 'code.copy')}</button>
+              </span>
+              <div className="gk-hint">{t('service.updateCodeHint')}</div>
+            </dd>
+          </>
+        )}
         <dt>{t('service.upstream')}</dt><dd className="gk-mono">{service.upstreamBaseURL}</dd>
         <dt>{t('service.timeZone')}</dt><dd>{service.timeZone}</dd>
         <dt>{t('service.concurrency')}</dt><dd>{service.defaultMaxConcurrency}</dd>

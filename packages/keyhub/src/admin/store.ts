@@ -12,7 +12,7 @@ import type { RequestOutcome } from './relay.ts'
 import type { TokenUsage } from './usage.ts'
 
 /** Ledger schema generation, stored in `PRAGMA user_version`; it only increases. */
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 
 const SCHEMA_V1 = `
 CREATE TABLE departments (
@@ -89,8 +89,14 @@ CREATE TABLE files (
 CREATE INDEX files_user ON files(user_id);
 `
 
+/** Generation 3: optional employee token expiration and time-range usage index. */
+const SCHEMA_V3 = `
+ALTER TABLE employees ADD COLUMN expires_at INTEGER;
+CREATE INDEX usage_at ON usage(at);
+`
+
 /** Migrations by the generation they produce. */
-const MIGRATIONS: ReadonlyArray<readonly [number, string]> = [[1, SCHEMA_V1], [2, SCHEMA_V2]]
+const MIGRATIONS: ReadonlyArray<readonly [number, string]> = [[1, SCHEMA_V1], [2, SCHEMA_V2], [3, SCHEMA_V3]]
 
 /** Time zone recorded before any admin started the relay on this ledger. */
 export const DEFAULT_TIME_ZONE = 'Asia/Shanghai'
@@ -118,6 +124,8 @@ export interface EmployeeRecord extends Employee {
   readonly models: readonly string[] | undefined
   /** Simultaneous requests allowed; `undefined` applies the relay default. */
   readonly maxConcurrency: number | undefined
+  /** Epoch milliseconds when this employee's token expires; `undefined` when it does not expire. */
+  readonly expiresAt: number | undefined
 }
 
 /** An admitted employee with ledger details. */
@@ -204,6 +212,7 @@ function employeeOf(row: Row): EmployeeRecord {
     quota: quotaOf(row),
     models: row.models === null ? undefined : JSON.parse(str(row, 'models')) as string[],
     maxConcurrency: optNum(row, 'max_concurrency'),
+    expiresAt: optNum(row, 'expires_at'),
   }
 }
 
@@ -300,11 +309,13 @@ export class KeyhubStore {
   /**
    * Re-read an employee and department for an in-flight request.
    * @param userId - the employee.
-   * @returns the current admission, or `undefined` when either is gone or disabled.
+   * @param now - the instant, used to check token expiration.
+   * @returns the current admission, or `undefined` when either is gone, disabled, or expired.
    */
-  readmit(userId: string): LedgerAdmission | undefined {
+  readmit(userId: string, now = Date.now()): LedgerAdmission | undefined {
     const employee = this.employee(userId)
     if (employee === undefined || !employee.enabled) return undefined
+    if (employee.expiresAt !== undefined && now >= employee.expiresAt) return undefined
     const department = this.department(employee.departmentId)
     return department === undefined || !department.enabled ? undefined : { employee, department }
   }
@@ -340,15 +351,19 @@ export class KeyhubStore {
 
   /**
    * Add an employee with a fresh token.
-   * @param employee - the new entry's user id, name, and department.
+   * @param employee - the new entry's user id, name, department, and optional expiration instant.
    * @returns the plaintext token, which the ledger does not keep.
    */
-  addEmployee(employee: { userId: string, name: string, departmentId: string }): string {
+  addEmployee(employee: { userId: string, name: string, departmentId: string, expiresAt?: number }): string {
+    if (employee.name.trim().length === 0) throw new Error('员工姓名不能为空')
     if (this.department(employee.departmentId) === undefined) throw new Error(`部门 "${employee.departmentId}" 不存在`)
     if (!USER_ID_PATTERN.test(employee.userId)) throw new Error(`userId "${employee.userId}" 只能包含字母、数字、- 和 _`)
+    if (employee.expiresAt !== undefined && (!Number.isSafeInteger(employee.expiresAt) || employee.expiresAt < 0)) {
+      throw new Error('到期时间必须是时间戳（毫秒）')
+    }
     const token = generateToken()
-    this.db.prepare('INSERT INTO employees (user_id, name, department_id, token_sha256) VALUES (?, ?, ?, ?)')
-      .run(employee.userId, employee.name, employee.departmentId, hashToken(token))
+    this.db.prepare('INSERT INTO employees (user_id, name, department_id, token_sha256, expires_at) VALUES (?, ?, ?, ?, ?)')
+      .run(employee.userId, employee.name.trim(), employee.departmentId, hashToken(token), employee.expiresAt ?? null)
     return token
   }
 
@@ -366,21 +381,25 @@ export class KeyhubStore {
   /**
    * Update employee fields.
    * @param userId - the employee.
-   * @param patch - fields to change; `models: null` and `maxConcurrency: null` clear the limit.
+   * @param patch - fields to change; `models: null`, `maxConcurrency: null`, and `expiresAt: null` clear the limit.
    */
-  updateEmployee(userId: string, patch: { name?: string, departmentId?: string, enabled?: boolean, models?: readonly string[] | null, maxConcurrency?: number | null }): void {
+  updateEmployee(userId: string, patch: { name?: string, departmentId?: string, enabled?: boolean, models?: readonly string[] | null, maxConcurrency?: number | null, expiresAt?: number | null }): void {
     const current = this.employee(userId)
     if (current === undefined) throw new Error(`员工 ${userId} 不存在`)
+    if (patch.name !== undefined && patch.name.trim().length === 0) throw new Error('员工姓名不能为空')
     if (patch.departmentId !== undefined && this.department(patch.departmentId) === undefined) throw new Error(`部门 "${patch.departmentId}" 不存在`)
     if (patch.maxConcurrency != null && (!Number.isSafeInteger(patch.maxConcurrency) || patch.maxConcurrency < 1)) throw new Error('并发上限必须是正整数')
+    if (patch.expiresAt != null && (!Number.isSafeInteger(patch.expiresAt) || patch.expiresAt < 0)) throw new Error('到期时间必须是时间戳（毫秒）')
     const models = patch.models === undefined ? current.models : patch.models ?? undefined
     const maxConcurrency = patch.maxConcurrency === undefined ? current.maxConcurrency : patch.maxConcurrency ?? undefined
-    this.db.prepare('UPDATE employees SET name = ?, department_id = ?, enabled = ?, models = ?, max_concurrency = ? WHERE user_id = ?').run(
-      patch.name ?? current.name,
+    const expiresAt = patch.expiresAt === undefined ? current.expiresAt : patch.expiresAt ?? undefined
+    this.db.prepare('UPDATE employees SET name = ?, department_id = ?, enabled = ?, models = ?, max_concurrency = ?, expires_at = ? WHERE user_id = ?').run(
+      patch.name?.trim() ?? current.name,
       patch.departmentId ?? current.departmentId,
       (patch.enabled ?? current.enabled) ? 1 : 0,
       models === undefined ? null : JSON.stringify(models),
       maxConcurrency ?? null,
+      expiresAt ?? null,
       userId,
     )
   }
@@ -491,11 +510,19 @@ export class KeyhubStore {
    * @returns model ids with their prices.
    */
   prices(now: number): Array<{ model: string, price: ModelPrice }> {
-    const models = (this.db.prepare('SELECT DISTINCT model FROM prices ORDER BY model').all() as Row[]).map(row => str(row, 'model'))
-    return models.flatMap((model) => {
-      const price = this.priceAt(model, now)
-      return price === undefined ? [] : [{ model, price }]
-    })
+    const rows = this.db.prepare(`
+      SELECT p.model, p.input_cache_hit, p.input_cache_miss, p.output
+      FROM prices p
+      WHERE p.effective_from = (
+        SELECT MAX(p2.effective_from) FROM prices p2
+        WHERE p2.model = p.model AND p2.effective_from <= ?
+      )
+      ORDER BY p.model
+    `).all(now) as Row[]
+    return rows.map(row => ({
+      model: str(row, 'model'),
+      price: { inputCacheHit: num(row, 'input_cache_hit'), inputCacheMiss: num(row, 'input_cache_miss'), output: num(row, 'output') },
+    }))
   }
 
   /**
@@ -564,6 +591,54 @@ export class KeyhubStore {
   fileOwner(fileId: string): string | undefined {
     const row = this.db.prepare('SELECT user_id FROM files WHERE file_id = ?').get(fileId) as Row | undefined
     return row === undefined ? undefined : str(row, 'user_id')
+  }
+
+  /**
+   * Whether a file was uploaded through the relay by the given employee under the given department.
+   * @param fileId - DeepSeek file id.
+   * @param userId - the employee's user id.
+   * @param departmentId - the department whose key the request uses.
+   * @returns `true` when the file belongs to this employee and department.
+   */
+  fileOwns(fileId: string, userId: string, departmentId: string): boolean {
+    const row = this.db.prepare('SELECT user_id, department_id FROM files WHERE file_id = ?').get(fileId) as Row | undefined
+    return row !== undefined && str(row, 'user_id') === userId && str(row, 'department_id') === departmentId
+  }
+
+  /**
+   * Latest client IP address and distinct client IP addresses since `since` for each employee.
+   * @param since - start of the recent multi-IP window, epoch milliseconds.
+   * @returns map from `user_id` to latest address and recent distinct addresses.
+   */
+  clientAddresses(since: number): Map<string, { lastAddress: string, recentAddresses: readonly string[] }> {
+    const latestRows = this.db.prepare(`
+      SELECT u.user_id, u.client_address
+      FROM usage u
+      WHERE u.id = (
+        SELECT u2.id FROM usage u2
+        WHERE u2.user_id = u.user_id AND u2.client_address IS NOT NULL AND u2.client_address != ''
+        ORDER BY u2.at DESC, u2.id DESC LIMIT 1
+      )
+    `).all() as Row[]
+    const recentRows = this.db.prepare(`
+      SELECT user_id, client_address, MAX(at) AS last_at
+      FROM usage
+      WHERE at >= ? AND client_address IS NOT NULL AND client_address != ''
+      GROUP BY user_id, client_address
+      ORDER BY user_id, last_at DESC
+    `).all(since) as Row[]
+    const result = new Map<string, { lastAddress: string, recentAddresses: string[] }>()
+    for (const row of latestRows) {
+      result.set(str(row, 'user_id'), { lastAddress: str(row, 'client_address'), recentAddresses: [] })
+    }
+    for (const row of recentRows) {
+      const userId = str(row, 'user_id')
+      const address = str(row, 'client_address')
+      const entry = result.get(userId)
+      if (entry !== undefined) entry.recentAddresses.push(address)
+      else result.set(userId, { lastAddress: address, recentAddresses: [address] })
+    }
+    return result
   }
 
   /**

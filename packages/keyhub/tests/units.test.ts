@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { decodeAccessCode, encodeAccessCode, generateToken, normalizeFingerprint } from '../src/access-code.ts'
+import {
+  applyRelayUpdate, decodeAccessCode, decodeRelayUpdate, encodeAccessCode, encodeRelayUpdate, generateToken, isRelayUpdate, normalizeFingerprint,
+} from '../src/access-code.ts'
 import { assertTimeZone, formatYuan, parsePrice, parseYuan, periodStart, requestCostMicros } from '../src/admin/money.ts'
 import { rewriteMessagesBody } from '../src/admin/rewrite.ts'
 import { jsonUsageTap, streamUsageTap } from '../src/admin/usage.ts'
@@ -31,6 +33,20 @@ describe('access codes', () => {
 
   it('normalizes colon-separated fingerprints', () => {
     expect(normalizeFingerprint('AB:CD:EF')).toBe('abcdef')
+  })
+
+  it('encodes and applies relay update codes while keeping the employee token', () => {
+    const token = generateToken()
+    const original = encodeAccessCode({ relayURL: 'https://10.0.0.8:8443', fingerprint: FINGERPRINT, token })
+    const nextFingerprint = 'cd'.repeat(32)
+    const update = encodeRelayUpdate({ relayURL: 'https://10.0.0.99:9443/extra', fingerprint: nextFingerprint })
+    expect(isRelayUpdate(update)).toBe(true)
+    expect(isRelayUpdate(original)).toBe(false)
+    expect(decodeRelayUpdate(`  ${update}\n`)).toEqual({ relayURL: 'https://10.0.0.99:9443', fingerprint: nextFingerprint })
+    const updated = applyRelayUpdate(original, update)
+    expect(decodeAccessCode(updated)).toEqual({ relayURL: 'https://10.0.0.99:9443', fingerprint: nextFingerprint, token })
+    expect(() => decodeRelayUpdate('gkh1.abc')).toThrow('gkhu1.')
+    expect(() => decodeRelayUpdate(encodeRelayUpdate({ relayURL: 'https://10.0.0.8', fingerprint: undefined }))).toThrow('指纹')
   })
 })
 
@@ -95,6 +111,20 @@ describe('rewriteMessagesBody', () => {
   it('replaces non-object metadata', () => {
     const result = rewriteMessagesBody(Buffer.from('{"metadata":"x"}'), 'emp_a')
     expect(result.ok && JSON.parse(result.body.toString())).toEqual({ metadata: { user_id: 'emp_a' } })
+  })
+
+  it('collects referenced file_ids from messages, system, and container without touching tool schemas', () => {
+    const body = {
+      model: 'm',
+      system: [{ type: 'document', source: { type: 'file', file_id: 'file_sys' } }],
+      messages: [
+        { role: 'user', content: [{ type: 'image', source: { type: 'file', file_id: 'file_img' } }, { type: 'image', source: { type: 'file', file_id: 'file_img' } }] },
+      ],
+      container: { uploads: [{ file_id: 'file_cnt' }] },
+      tools: [{ name: 't', input_schema: { properties: { file_id: { type: 'string' } } } }],
+    }
+    const result = rewriteMessagesBody(Buffer.from(JSON.stringify(body)), 'emp_a')
+    expect(result.ok && result.fileIds).toEqual(['file_img', 'file_sys', 'file_cnt'])
   })
 })
 

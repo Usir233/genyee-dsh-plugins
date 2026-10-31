@@ -33,7 +33,7 @@
 | 项目 | 管理员电脑 | 员工电脑 |
 |---|---|---|
 | DSH 桌面端 | 0.2.x，从 `0.2.1-rc.1` 起 | 同左 |
-| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.1.tgz` | 同左 |
+| 插件包 | `releases/keyhub/genyee-dsh-keyhub-0.2.2.tgz` | 同左 |
 | Node.js 24 以上 | 需要（生成证书时用一次） | 不需要 |
 | DeepSeek Key | 公司账号下每个部门一个 | 不需要 |
 | 网络 | 一个固定的内网 IP，员工能访问它的 8443 端口 | 能访问管理员电脑 |
@@ -54,7 +54,7 @@
 node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tools.js make-cert --ip 10.0.0.8 --out ~/keyhub
 ```
 
-命令会生成 `relay.crt` 和 `relay.key`。证书只写入这个 IP，IP 变了需要重新生成证书，并给员工重新发放接入码。
+命令会生成 `relay.crt` 和 `relay.key`。证书只写入这个 IP，IP 变了需要重新生成证书，并在“服务状态”页复制**连接更新码**（`gkhu1.` 开头）发给员工粘贴更新，无需逐人重置接入码。
 
 ### 3. 打开管理员模式
 
@@ -80,8 +80,8 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 打开左侧栏 **Genyee 密钥中心**，按顺序操作：
 
 1. **部门**：新增部门（例如 ID `rd`、名称“研发部”）。点**设置 Key**，粘贴该部门的 DeepSeek Key，状态变为“已配置”。
-2. **价格**：按 DeepSeek 官网价格，为每个要开放的模型填写三项价格：输入缓存命中、输入缓存未命中、输出，单位为元/百万 token。**没有价格的模型员工无法使用。**
-3. **员工**：新增员工，弹出的接入码**只显示这一次**，复制后安全地交给员工。管理员也要给自己建一条员工记录。
+2. **价格**：点**填入常用模型参考价**一键填充，或按 DeepSeek 官网价格为每个要开放的模型填写三项价格：输入缓存命中、输入缓存未命中、输出，单位为元/百万 token。**没有价格的模型员工无法使用。**
+3. **员工**：新增员工（可选设置授权到期日），弹出的接入码**只显示这一次**，复制后安全地交给员工。管理员也要给自己建一条员工记录。
 4. **额度**（可选）：为部门或员工设置每日、每周、每月、每年或总额度。
 5. **服务状态**：点**查询余额**，确认能查到公司账号余额。
 
@@ -104,7 +104,8 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 |---|---|---|
 | 停用员工 | 员工 → 停用 | 下一个请求即被拒绝，正在输出的回复立即中断 |
 | 员工丢失或泄露接入码 | 员工 → 重置接入码 | 旧码立即失效，新码只显示一次 |
-| 调整部门、可用模型、并发上限 | 员工 → 编辑 | 员工换部门后，已用金额留在原部门 |
+| 调整姓名、部门、可用模型、并发上限、有效期 | 员工 → 编辑 | 员工换部门后，已用金额留在原部门，旧部门上传的文件不再混用 |
+| 管理端换 IP 或换证书 | 服务状态 → 连接更新码 | 复制 `gkhu1.` 更新码群发给员工粘贴，员工保留原授权码 |
 | 设置额度 | 额度 → 设置额度 | 只改金额不影响本周期已用；改周期则从现在重新计算 |
 | 临时追加额度 | 额度 → 追加额度 | 只在当前周期有效；“总额度”的追加永久有效 |
 | 停用整个部门 | 部门 → 停用 | 该部门所有员工立即不可用 |
@@ -128,6 +129,7 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 |---|---|---|
 | 尚未填写 Genyee 接入码 | 没有保存接入码 | 在设置中粘贴接入码 |
 | 授权码无效或已被管理员停用 | 员工或部门被停用，或接入码已被重置 | 联系管理员 |
+| 你的授权码已过期，请联系管理员续期或重置 | 到了管理员设置的授权到期时间 | 管理员在“员工 → 编辑”中延长或清除有效期 |
 | 你的本月额度已用完（已用 ¥…，额度 ¥…） | 员工或部门额度用完 | 管理员追加或调整额度 |
 | 你没有使用模型 … 的权限 | 该模型不在员工的可用列表中 | 换模型，或请管理员开放 |
 | 管理员尚未设置模型 … 的价格 | 价格表里没有该模型 | 管理员在“价格”中补充 |
@@ -175,7 +177,7 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 - `<DSH>/.credentials.yaml`（部门 Key；请妥善保管）
 - `relay.crt` 和 `relay.key`
 
-**迁移到新电脑**：把这三类文件拷到新电脑，按“管理员：首次配置”第 1、3 步安装和配置，并把 `listenHost` 改成新电脑的 IP。如果 IP 变了，需要重新生成证书并给所有员工重置接入码。
+**迁移到新电脑**：把这三类文件拷到新电脑，按“管理员：首次配置”第 1、3 步安装和配置，并把 `listenHost` 改成新电脑的 IP。如果 IP 变了，重新生成证书后把“服务状态”页的 `gkhu1.` 连接更新码发给员工粘贴即可，无需逐人重置接入码。
 
 ## 命令行工具
 
@@ -183,12 +185,15 @@ node <DSH>/profiles/desktop/node_modules/@genyee/dsh-keyhub/lib/tools/admin-tool
 
 ```sh
 T department --db DB --id rd --name 研发部 --key-ref GENYEE_DEEPSEEK_KEY_RD
+T price --db DB --defaults
 T price --db DB --model deepseek-flash --hit 0.2 --miss 2 --output 3
-T employee-add --db DB --name 张三 --department rd --relay https://10.0.0.8:8443 --cert ~/keyhub/relay.crt
+T employee-add --db DB --name 张三 --department rd --expires 2026-12-31 --relay https://10.0.0.8:8443 --cert ~/keyhub/relay.crt
 T quota --db DB --employee emp_xxx --amount 200 --period month
 T top-up --db DB --employee emp_xxx --amount 50 --note 项目加急
+T employee --db DB --user emp_xxx --name 张三 --expires 2027-06-30
 T employee --db DB --user emp_xxx --disable
 T employee --db DB --user emp_xxx --reset-token --relay https://10.0.0.8:8443 --cert ~/keyhub/relay.crt
+T relay-code --relay https://10.0.0.8:8443 --cert ~/keyhub/relay.crt
 T report --db DB
 T export --db DB --from 2026-10-01 --to 2026-11-01 --out usage.csv
 ```

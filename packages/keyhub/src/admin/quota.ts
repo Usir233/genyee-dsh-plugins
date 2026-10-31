@@ -85,7 +85,7 @@ export type CheckResult =
 /** Bytes of a JSON request body per input token assumed when reserving; low, so the reservation errs high. */
 const RESERVE_BYTES_PER_TOKEN = 2
 /** Output tokens assumed when a request names no `max_tokens`. */
-const RESERVE_DEFAULT_OUTPUT_TOKENS = 32_000
+const RESERVE_DEFAULT_OUTPUT_TOKENS = 4_096
 
 /**
  * Cost to reserve for a request in flight, before its usage is known.
@@ -112,6 +112,23 @@ export interface CheckSettings {
 }
 
 /**
+ * Refuse an employee whose authorization token has passed its expiration time.
+ * @param admission - the employee and department.
+ * @param now - the instant.
+ * @returns the refusal, or `undefined` when the token has not expired.
+ */
+export function checkExpiry(admission: LedgerAdmission, now: number): Refusal | undefined {
+  const { expiresAt } = admission.employee
+  if (expiresAt === undefined || now < expiresAt) return undefined
+  return {
+    status: 400,
+    type: 'invalid_request_error',
+    code: 'keyhub_token_expired',
+    message: '你的授权码已过期，请联系管理员续期或重置',
+  }
+}
+
+/**
  * Check both quota levels of an admitted employee.
  * Spending plus the reservations of requests already in flight must stay below each allowance; the new request's own
  * cost is not counted, so the last admitted request may overrun by at most its own cost.
@@ -125,6 +142,8 @@ export interface CheckSettings {
 export function checkQuotas(
   store: KeyhubStore, admission: LedgerAdmission, pending: Pick<PendingRequests, 'employeeMicros' | 'departmentMicros'>, now: number, timeZone: string,
 ): Refusal | undefined {
+  const expired = checkExpiry(admission, now)
+  if (expired !== undefined) return expired
   const { employee, department } = admission
   const subjects: Array<[QuotaScope, string, Quota | undefined, string, number]> = [
     ['employee', employee.userId, employee.quota, '你的', pending.employeeMicros],
@@ -157,6 +176,8 @@ export function checkQuotas(
  */
 export function checkRequest(store: KeyhubStore, request: RequestCheck, settings: CheckSettings): CheckResult {
   const refuse = (refusal: Refusal): CheckResult => ({ ok: false, refusal })
+  const expired = checkExpiry(request.admission, request.now)
+  if (expired !== undefined) return refuse(expired)
   const { employee } = request.admission
   if (request.model === undefined) return refuse({ status: 400, type: 'invalid_request_error', code: 'keyhub_model_missing', message: '请求缺少 model 字段' })
   if (employee.models !== undefined && !employee.models.includes(request.model)) {

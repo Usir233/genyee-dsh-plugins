@@ -1,7 +1,7 @@
 /** HTTP request handling of the admin relay: admission, rewriting, streaming, interruption, file ownership, and usage capture. */
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from 'node:http'
-import { request as httpRequest } from 'node:http'
-import { request as httpsRequest } from 'node:https'
+import { Agent as HttpAgent, request as httpRequest } from 'node:http'
+import { Agent as HttpsAgent, request as httpsRequest } from 'node:https'
 import { Transform } from 'node:stream'
 import type { Admission } from './directory.ts'
 import type { CheckResult, PendingRequests, Refusal } from './quota.ts'
@@ -37,11 +37,12 @@ export interface FileOwnership {
    */
   record(fileId: string, admission: Admission): void
   /**
-   * The uploader of a file.
+   * Whether a file belongs to the admitted employee in their current department.
    * @param fileId - DeepSeek file id.
-   * @returns the uploader's user id, or `undefined` for a file the relay did not upload.
+   * @param admission - the employee and department.
+   * @returns `true` when the file was uploaded by this employee under this department.
    */
-  owner(fileId: string): string | undefined
+  owns(fileId: string, admission: Admission): boolean
   /**
    * Forget a deleted file.
    * @param fileId - DeepSeek file id.
@@ -241,6 +242,8 @@ interface Forwarded {
 export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Relay<A> {
   const root = apiRoot(deps.upstreamBaseURL)
   const inFlight = new Set<InFlight<A>>()
+  const httpAgent = new HttpAgent({ keepAlive: true })
+  const httpsAgent = new HttpsAgent({ keepAlive: true })
 
   const pendingOf = (admission: A): PendingRequests => {
     let count = 0
@@ -259,7 +262,14 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
     const token = req.headers['x-api-key']
     const admission = typeof token === 'string' && token.length > 0 ? deps.admit(token) : undefined
     // 400, not 401: DSH shows its own "API key invalid" text for 401 instead of this message (see Refusal).
-    if (admission === undefined) replyError(res, 400, 'invalid_request_error', '授权码无效或已被管理员停用，请联系管理员', 'keyhub_unauthorized')
+    if (admission === undefined) {
+      replyError(res, 400, 'invalid_request_error', '授权码无效或已被管理员停用，请联系管理员', 'keyhub_unauthorized')
+      return undefined
+    }
+    if (admission.employee.expiresAt !== undefined && Date.now() >= admission.employee.expiresAt) {
+      replyError(res, 400, 'invalid_request_error', '你的授权码已过期，请联系管理员续期或重置', 'keyhub_token_expired')
+      return undefined
+    }
     return admission
   }
 
@@ -293,7 +303,8 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
       inFlight.delete(entry)
       resolve({ outcome, status, observed: tap?.finish() })
     }
-    const upstream = (target.protocol === 'https:' ? httpsRequest : httpRequest)(target, { method, headers })
+    const isHttps = target.protocol === 'https:'
+    const upstream = (isHttps ? httpsRequest : httpRequest)(target, { method, headers, agent: isHttps ? httpsAgent : httpAgent })
     const entry: InFlight<A> = {
       ...entryBase,
       abort() {
@@ -390,6 +401,12 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
       replyError(res, 400, 'invalid_request_error', rewrite.reason)
       return
     }
+    for (const fileId of rewrite.fileIds) {
+      if (!deps.files.owns(fileId, admission)) {
+        replyError(res, 400, 'invalid_request_error', `请求引用的文件 ${fileId} 不存在或不属于你`, 'keyhub_file_forbidden')
+        return
+      }
+    }
     const key = await departmentKey(admission, res)
     if (key === undefined) return
     const verdict = deps.check(admission, { model: rewrite.model, maxTokens: rewrite.maxTokens, bodyBytes: rewrite.body.length }, pendingOf(admission))
@@ -419,7 +436,7 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
     const page = JSON.parse(body.toString('utf8')) as Record<string, unknown>
     if (!Array.isArray(page.data)) throw new Error('the file list has no data array')
     page.data = page.data.filter(file => typeof file === 'object' && file !== null
-      && deps.files.owner(String((file as Record<string, unknown>).id)) === admission.employee.userId)
+      && deps.files.owns(String((file as Record<string, unknown>).id), admission))
     return Buffer.from(JSON.stringify(page), 'utf8')
   }
 
@@ -441,7 +458,7 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
     if (admission === undefined) return
     const rest = url.pathname.slice(FILES_PATH.length)
     const fileId = rest.length > 1 ? decodeURIComponent(rest.slice(1).split('/')[0]!) : undefined
-    if (fileId !== undefined && deps.files.owner(fileId) !== admission.employee.userId) {
+    if (fileId !== undefined && !deps.files.owns(fileId, admission)) {
       replyError(res, 404, 'not_found_error', NOT_FOUND_FILE)
       return
     }
@@ -519,6 +536,8 @@ export function createRelay<A extends Admission>(deps: RelayDependencies<A>): Re
     },
     closeAll() {
       for (const entry of [...inFlight]) entry.abort()
+      httpAgent.destroy()
+      httpsAgent.destroy()
     },
   }
 }

@@ -2,10 +2,11 @@
  * Management-page commands of the admin role, served on {@link ADMIN_ROUTE}. Only the owner of the admin's DSH reaches
  * the route (see `src/rpc-route.ts`); employees reach the relay, never this route.
  */
+import { encodeRelayUpdate } from '../access-code.ts'
 import type { RpcAnswer, RpcHandler } from '../rpc-route.ts'
 import type { BalanceMonitor, BalanceReading } from './balance.ts'
 import type { LedgerOverview } from './ledger-ops.ts'
-import { newUserId, overview, topUp, usageCsv } from './ledger-ops.ts'
+import { applyDefaultPrices, newUserId, overview, topUp, usageCsv } from './ledger-ops.ts'
 import { parsePrice, parseYuan, QUOTA_PERIODS } from './money.ts'
 import type { KeyhubStore, QuotaScope } from './store.ts'
 
@@ -18,6 +19,8 @@ export interface ServiceInfo {
   readonly relayURL: string
   /** Certificate fingerprint carried in access codes; absent for plain HTTP. */
   readonly fingerprint: string | undefined
+  /** Connection update code (`gkhu1.…`) carrying only the relay origin and certificate fingerprint. */
+  readonly relayUpdateCode?: string
   readonly upstreamBaseURL: string
   readonly timeZone: string
   readonly defaultMaxConcurrency: number
@@ -104,6 +107,15 @@ class Payload {
     return value
   }
 
+  /** `undefined` when absent, `null` when explicitly cleared. */
+  nullableInstant(name: string): number | null | undefined {
+    if (!(name in this.fields)) return undefined
+    const value = this.fields[name]
+    if (value === null) return null
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new InvalidPayload(`字段 ${name} 必须是时间戳（毫秒）`)
+    return value
+  }
+
   instant(name: string): number {
     const value = this.fields[name]
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) throw new InvalidPayload(`字段 ${name} 必须是时间戳（毫秒）`)
@@ -138,12 +150,16 @@ export interface ManagementState extends LedgerOverview {
 export function createAdminRpc(deps: AdminRpcDependencies): RpcHandler {
   const now = deps.now ?? Date.now
   const { store } = deps
+  const service: ServiceInfo = {
+    ...deps.service,
+    relayUpdateCode: deps.service.relayUpdateCode ?? encodeRelayUpdate({ relayURL: deps.service.relayURL, fingerprint: deps.service.fingerprint }),
+  }
 
   const state = async (): Promise<ManagementState> => {
     const ledger = overview(store, now())
     const keyConfigured: Record<string, boolean> = {}
     for (const department of ledger.departments) keyConfigured[department.id] = await deps.keyConfigured(department.keyRef)
-    return { ...ledger, keyConfigured, service: deps.service, balance: deps.balance.latest() }
+    return { ...ledger, keyConfigured, service, balance: deps.balance.latest() }
   }
 
   /** Run a ledger write, then let the relay re-check in-flight requests. */
@@ -187,7 +203,13 @@ export function createAdminRpc(deps: AdminRpcDependencies): RpcHandler {
 
     async 'employee.add'(payload) {
       const userId = newUserId()
-      const token = write(() => store.addEmployee({ userId, name: payload.string('name'), departmentId: payload.string('departmentId') }))
+      const expiresAt = payload.nullableInstant('expiresAt') ?? undefined
+      const token = write(() => store.addEmployee({
+        userId,
+        name: payload.string('name'),
+        departmentId: payload.string('departmentId'),
+        ...expiresAt === undefined ? {} : { expiresAt },
+      }))
       return { userId, accessCode: deps.accessCode(token), state: await state() }
     },
 
@@ -200,6 +222,7 @@ export function createAdminRpc(deps: AdminRpcDependencies): RpcHandler {
           ...payload.optionalBoolean('enabled') === undefined ? {} : { enabled: payload.optionalBoolean('enabled')! },
           ...payload.nullableStrings('models') === undefined ? {} : { models: payload.nullableStrings('models')! },
           ...payload.nullableInteger('maxConcurrency') === undefined ? {} : { maxConcurrency: payload.nullableInteger('maxConcurrency')! },
+          ...payload.nullableInstant('expiresAt') === undefined ? {} : { expiresAt: payload.nullableInstant('expiresAt')! },
         })
       })
       return state()
@@ -246,6 +269,11 @@ export function createAdminRpc(deps: AdminRpcDependencies): RpcHandler {
     async 'price.remove'(payload) {
       const model = payload.string('model')
       write(() => { store.removePrice(model) })
+      return state()
+    },
+
+    async 'price.defaults'() {
+      write(() => { applyDefaultPrices(store, now()) })
       return state()
     },
 

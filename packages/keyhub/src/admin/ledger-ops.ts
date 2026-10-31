@@ -2,12 +2,42 @@
 import { randomBytes, X509Certificate } from 'node:crypto'
 import { normalizeFingerprint } from '../access-code.ts'
 import type { QuotaPeriod } from './money.ts'
-import { formatYuan, MICROS_PER_YUAN, periodStart, PRICE_UNITS_PER_YUAN } from './money.ts'
+import { formatYuan, MICROS_PER_YUAN, parsePrice, periodStart, PRICE_UNITS_PER_YUAN } from './money.ts'
 import type { QuotaStanding } from './quota.ts'
 import { quotaStanding } from './quota.ts'
 import type { DepartmentRecord, EmployeeRecord, KeyhubStore, LedgerAdmission, Quota, QuotaScope, UsageFilter } from './store.ts'
 
 const BASE32 = 'abcdefghijklmnopqrstuvwxyz234567'
+/** Window for flagging multiple distinct client IPs per employee. */
+const RECENT_IP_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/** Reference prices (元 per million tokens) for common DeepSeek models. */
+export const DEFAULT_MODEL_PRICES: ReadonlyArray<{ readonly model: string, readonly hit: string, readonly miss: string, readonly output: string }> = [
+  { model: 'deepseek-flash', hit: '0.2', miss: '2', output: '3' },
+  { model: 'deepseek-v4-pro', hit: '1', miss: '4', output: '16' },
+  { model: 'deepseek-chat', hit: '0.2', miss: '2', output: '3' },
+  { model: 'deepseek-reasoner', hit: '0.2', miss: '2', output: '3' },
+]
+
+/**
+ * Fill reference prices for common DeepSeek models that have no price yet.
+ * @param store - the ledger.
+ * @param now - effective time.
+ * @returns number of models whose price was added.
+ */
+export function applyDefaultPrices(store: KeyhubStore, now: number): number {
+  let added = 0
+  for (const entry of DEFAULT_MODEL_PRICES) {
+    if (store.priceAt(entry.model, now) !== undefined) continue
+    store.setPrice(entry.model, {
+      inputCacheHit: parsePrice(entry.hit),
+      inputCacheMiss: parsePrice(entry.miss),
+      output: parsePrice(entry.output),
+    }, now)
+    added++
+  }
+  return added
+}
 
 /**
  * Create a random DeepSeek `user_id` without personal data.
@@ -101,6 +131,8 @@ export interface EmployeeView extends Omit<EmployeeRecord, 'quota' | 'tokenSha25
   readonly quota: QuotaView | undefined
   readonly monthSpentMicros: number
   readonly monthRequests: number
+  readonly lastClientAddress: string | undefined
+  readonly recentClientAddresses: readonly string[]
 }
 
 /** One current model price, in 元 per million tokens. */
@@ -130,6 +162,7 @@ export function overview(store: KeyhubStore, now: number): LedgerOverview {
   const month = periodStart('month', now, timeZone)!
   const byEmployee = new Map(store.spending('employee', month, now + 1).map(row => [row.id, row]))
   const byDepartment = new Map(store.spending('department', month, now + 1).map(row => [row.id, row]))
+  const addresses = store.clientAddresses(now - RECENT_IP_WINDOW_MS)
   const employees = store.employees()
   return {
     timeZone,
@@ -142,17 +175,23 @@ export function overview(store: KeyhubStore, now: number): LedgerOverview {
       monthSpentMicros: byDepartment.get(department.id)?.costMicros ?? 0,
       employees: employees.filter(employee => employee.departmentId === department.id).length,
     })),
-    employees: employees.map(employee => ({
-      userId: employee.userId,
-      name: employee.name,
-      departmentId: employee.departmentId,
-      enabled: employee.enabled,
-      models: employee.models,
-      maxConcurrency: employee.maxConcurrency,
-      quota: quotaView(store, 'employee', employee.userId, employee.quota, now),
-      monthSpentMicros: byEmployee.get(employee.userId)?.costMicros ?? 0,
-      monthRequests: byEmployee.get(employee.userId)?.requests ?? 0,
-    })),
+    employees: employees.map((employee) => {
+      const ip = addresses.get(employee.userId)
+      return {
+        userId: employee.userId,
+        name: employee.name,
+        departmentId: employee.departmentId,
+        enabled: employee.enabled,
+        models: employee.models,
+        maxConcurrency: employee.maxConcurrency,
+        expiresAt: employee.expiresAt,
+        quota: quotaView(store, 'employee', employee.userId, employee.quota, now),
+        monthSpentMicros: byEmployee.get(employee.userId)?.costMicros ?? 0,
+        monthRequests: byEmployee.get(employee.userId)?.requests ?? 0,
+        lastClientAddress: ip?.lastAddress,
+        recentClientAddresses: ip?.recentAddresses ?? [],
+      }
+    }),
     prices: store.prices(now).map(({ model, price }) => ({
       model,
       inputCacheHit: price.inputCacheHit / PRICE_UNITS_PER_YUAN,
@@ -171,6 +210,8 @@ export interface EmployeeStatus {
   readonly models: readonly string[]
   readonly maxConcurrency: number
   readonly quota: { readonly employee: QuotaView | undefined, readonly department: QuotaView | undefined }
+  /** Epoch milliseconds when this employee's token expires, if set. */
+  readonly expiresAt?: number
   /** Version of the plugin serving the relay. */
   readonly relayVersion: string
 }
@@ -197,6 +238,7 @@ export function employeeStatus(store: KeyhubStore, admission: LedgerAdmission, n
       employee: quotaView(store, 'employee', employee.userId, employee.quota, now),
       department: quotaView(store, 'department', department.id, department.quota, now),
     },
+    ...employee.expiresAt === undefined ? {} : { expiresAt: employee.expiresAt },
     relayVersion,
   }
 }

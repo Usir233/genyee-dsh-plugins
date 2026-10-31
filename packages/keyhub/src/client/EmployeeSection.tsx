@@ -61,6 +61,7 @@ export function EmployeeSection({ t, call }: EmployeeSectionProps) {
               {status.quota.employee !== undefined && <span>{quotaLine(t, 'employeeSection.employeeQuota', status.quota.employee)}</span>}
               {status.quota.department !== undefined && <span>{quotaLine(t, 'employeeSection.departmentQuota', status.quota.department)}</span>}
               {status.quota.employee === undefined && status.quota.department === undefined && <span>{t('employeeSection.noQuota')}</span>}
+              {status.expiresAt !== undefined && <span>{t('employeeSection.expiresAt', { date: new Date(status.expiresAt).toLocaleDateString() })}</span>}
             </>
           )}
         </div>

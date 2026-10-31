@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { decodeAccessCode, encodeAccessCode, generateToken } from '../src/access-code.ts'
+import { decodeAccessCode, encodeAccessCode, encodeRelayUpdate, generateToken } from '../src/access-code.ts'
 import { BalanceMonitor, parseBalance } from '../src/admin/balance.ts'
 import { assertConcreteHost } from '../src/admin/index.ts'
 import { quotaView, topUp, usageCsv } from '../src/admin/ledger-ops.ts'
@@ -159,19 +159,22 @@ describe('admin RPC', () => {
     expect(store.admit(code.token)).toBeUndefined()
     expect(store.admit(decodeAccessCode(reset.accessCode).token)?.employee.userId).toBe(added.userId)
 
-    value(await call('employee.update', { userId: added.userId, enabled: false, models: ['deepseek-flash'], maxConcurrency: 3 }))
-    expect(store.employee(added.userId)).toMatchObject({ enabled: false, models: ['deepseek-flash'], maxConcurrency: 3 })
-    value(await call('employee.update', { userId: added.userId, models: null, maxConcurrency: null }))
-    expect(store.employee(added.userId)).toMatchObject({ models: undefined, maxConcurrency: undefined })
+    value(await call('employee.update', { userId: added.userId, name: '张三丰', enabled: false, models: ['deepseek-flash'], maxConcurrency: 3, expiresAt: 1_800_000_000_000 }))
+    expect(store.employee(added.userId)).toMatchObject({ name: '张三丰', enabled: false, models: ['deepseek-flash'], maxConcurrency: 3, expiresAt: 1_800_000_000_000 })
+    value(await call('employee.update', { userId: added.userId, models: null, maxConcurrency: null, expiresAt: null }))
+    expect(store.employee(added.userId)).toMatchObject({ models: undefined, maxConcurrency: undefined, expiresAt: undefined })
 
     const quota = value(await call('quota.set', { scope: 'department', id: 'sales', amount: '500', period: 'month' }))
     expect(quota.departments.find((entry: { id: string }) => entry.id === 'sales').quota).toMatchObject({ period: 'month', allowanceMicros: parseYuan('500') })
     value(await call('quota.topUp', { scope: 'department', id: 'sales', amount: '20.5', note: '加急' }))
     const priced = value(await call('price.set', { model: 'deepseek-flash', hit: '0.2', miss: '2', output: '3' }))
     expect(priced.prices).toEqual([{ model: 'deepseek-flash', inputCacheHit: 0.2, inputCacheMiss: 2, output: 3 }])
+    expect(priced.service.relayUpdateCode).toMatch(/^gkhu1\./u)
     expect(priced.departments.find((entry: { id: string }) => entry.id === 'sales').quota.allowanceMicros).toBe(parseYuan('520.5'))
     value(await call('price.set', { model: 'typo-model', hit: '1', miss: '1', output: '1' }))
     expect(value(await call('price.remove', { model: 'typo-model' })).prices.map((entry: { model: string }) => entry.model)).toEqual(['deepseek-flash'])
+    const withDefaults = value(await call('price.defaults', {}))
+    expect(withDefaults.prices.map((entry: { model: string }) => entry.model)).toContain('deepseek-v4-pro')
     expect(await call('price.remove', { model: 'typo-model' })).toMatchObject({ ok: false, error: { message: expect.stringContaining('不存在') } })
     expect(changes).toBeGreaterThanOrEqual(6)
   })
@@ -186,20 +189,28 @@ describe('admin RPC', () => {
     expect(await call('constructor', {})).toMatchObject({ ok: false, error: { code: 'keyhub/unknown-endpoint' } })
   })
 
-  it('summarizes and exports usage for a range', async () => {
-    store.recordUsage({ at: 100, userId: 'emp_bob', departmentId: 'rd', model: 'm', status: 200, outcome: 'completed', usage: undefined, estimated: false, costMicros: 7, clientAddress: undefined })
-    const summary = value(await rpc()('usage.summary', { from: 0, to: 1000 }))
-    expect(summary.employees).toMatchObject([{ id: 'emp_bob', requests: 1, costMicros: 7 }])
-    const exported = value(await rpc()('usage.csv', { from: 0, to: 1000, departmentId: 'rd' }))
+  it('summarizes and exports usage for a range, and tracks client IPs', async () => {
+    const now = Date.UTC(2026, 9, 15)
+    store.recordUsage({ at: now - 5000, userId: 'emp_bob', departmentId: 'rd', model: 'm', status: 200, outcome: 'completed', usage: undefined, estimated: false, costMicros: 3, clientAddress: '10.0.0.11' })
+    store.recordUsage({ at: now - 1000, userId: 'emp_bob', departmentId: 'rd', model: 'm', status: 200, outcome: 'completed', usage: undefined, estimated: false, costMicros: 4, clientAddress: '10.0.0.12' })
+    const summary = value(await rpc()('usage.summary', { from: 0, to: now }))
+    expect(summary.employees).toMatchObject([{ id: 'emp_bob', requests: 2, costMicros: 7 }])
+    const state = value(await rpc()('state', {}))
+    expect(state.employees.find((entry: { userId: string }) => entry.userId === 'emp_bob')).toMatchObject({
+      lastClientAddress: '10.0.0.12',
+      recentClientAddresses: ['10.0.0.12', '10.0.0.11'],
+    })
+    const exported = value(await rpc()('usage.csv', { from: 0, to: now, departmentId: 'rd' }))
     expect(exported.csv).toContain('emp_bob')
     expect(await rpc()('usage.csv', { from: 1000, to: 0 })).toMatchObject({ ok: false })
   })
 })
 
 describe('employee RPC', () => {
-  const code = encodeAccessCode({ relayURL: 'https://10.0.0.8:8443', fingerprint: 'b'.repeat(64), token: generateToken() })
+  const token = generateToken()
+  const code = encodeAccessCode({ relayURL: 'https://10.0.0.8:8443', fingerprint: 'b'.repeat(64), token })
 
-  it('validates and stores the access code, then reports the relay status', async () => {
+  it('validates and stores the access code, applies relay update codes, and reports status', async () => {
     let saved: string | undefined
     const rpc = createEmployeeRpc({
       accessCodeRef: 'GENYEE_KEYHUB_ACCESS_CODE',
@@ -210,8 +221,12 @@ describe('employee RPC', () => {
     })
     expect(value(await rpc('status', {}))).toMatchObject({ configured: false, connected: false })
     expect(await rpc('accessCode.save', { code: 'not-a-code' })).toMatchObject({ ok: false, error: { message: expect.stringContaining('gkh1.') } })
+    const updateCode = encodeRelayUpdate({ relayURL: 'https://10.0.0.99:8443', fingerprint: 'c'.repeat(64) })
+    expect(await rpc('accessCode.save', { code: updateCode })).toMatchObject({ ok: false, error: { message: expect.stringContaining('尚未保存个人接入码') } })
     expect(value(await rpc('accessCode.save', { code: `  ${code}\n` }))).toMatchObject({ configured: true, connected: true, relayURL: 'https://10.0.0.8:8443', status: { employee: 'Bob' } })
     expect(saved).toBe(code)
+    expect(value(await rpc('accessCode.save', { code: ` ${updateCode} ` }))).toMatchObject({ configured: true, connected: true, relayURL: 'https://10.0.0.99:8443' })
+    expect(decodeAccessCode(saved!)).toEqual({ relayURL: 'https://10.0.0.99:8443', fingerprint: 'c'.repeat(64), token })
     expect(value(await rpc('accessCode.clear', {}))).toMatchObject({ configured: false })
   })
 

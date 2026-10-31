@@ -19,6 +19,8 @@ export interface Employee {
   /** Lowercase hex SHA-256 of the employee's authorization token. */
   readonly tokenSha256: string
   readonly enabled: boolean
+  /** Epoch milliseconds when this employee's token expires; `undefined` when it does not expire. */
+  readonly expiresAt?: number
 }
 
 /** An employee admitted to use the relay, with the department that pays for the request. */

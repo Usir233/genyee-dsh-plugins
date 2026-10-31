@@ -307,6 +307,56 @@ describe('relay', () => {
     expect(harness.store.fileOwner('file_alice')).toBeUndefined()
   })
 
+  it('verifies file_id ownership and department isolation in Messages requests', async () => {
+    harness.store.recordFile('file_alice', 'emp_alice', 'sales', 0)
+    harness.store.recordFile('file_bob', 'emp_bob', 'rd', 0)
+
+    const foreign = await messages(harness.url, harness.alice, {
+      model: FLASH,
+      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'file', file_id: 'file_bob' } }] }],
+    })
+    expect(foreign.status).toBe(400)
+    expect(await foreign.json()).toMatchObject({ error: { code: 'keyhub_file_forbidden', message: expect.stringContaining('file_bob') } })
+    expect(upstream.received).toHaveLength(0)
+
+    const allowed = await messages(harness.url, harness.alice, {
+      model: FLASH,
+      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'file', file_id: 'file_alice' } }] }],
+    })
+    expect(allowed.status).toBe(200)
+    await allowed.text()
+    expect(upstream.received).toHaveLength(1)
+
+    // Moving Alice to another department isolates files uploaded under her old department's key.
+    harness.store.updateEmployee('emp_alice', { departmentId: 'rd' })
+    const moved = await messages(harness.url, harness.alice, {
+      model: FLASH,
+      messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'file', file_id: 'file_alice' } }] }],
+    })
+    expect(moved.status).toBe(400)
+    expect(await moved.json()).toMatchObject({ error: { code: 'keyhub_file_forbidden' } })
+  })
+
+  it('refuses expired tokens and interrupts in-flight streams upon expiration', async () => {
+    harness.store.updateEmployee('emp_alice', { expiresAt: Date.now() - 1000 })
+    const refused = await messages(harness.url, harness.alice, { model: FLASH, messages: [] })
+    expect(refused.status).toBe(400)
+    expect(await refused.json()).toMatchObject({ error: { code: 'keyhub_token_expired', message: expect.stringContaining('已过期') } })
+    expect((await fetch(`${harness.url}/keyhub/v1/status`, { headers: { 'x-api-key': harness.alice } })).status).toBe(400)
+
+    harness.store.updateEmployee('emp_alice', { expiresAt: Date.now() + 60_000 })
+    upstream.respond((_request, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      sseEvent(res, 'message_start', { type: 'message_start', message: { usage: { input_tokens: 2, output_tokens: 0 } } })
+    })
+    const active = await messages(harness.url, harness.alice, { model: FLASH, messages: [] })
+    const reader = active.body!.getReader()
+    await reader.read()
+    harness.store.updateEmployee('emp_alice', { expiresAt: Date.now() - 1 })
+    harness.sync()
+    await expect(async () => { while (!(await reader.read()).done) { /* drain */ } }).rejects.toThrow()
+  })
+
   it('refuses file uploads above the size limit even without a declared length', async () => {
     const chunk = new Uint8Array(256 * 1024)
     let sent = 0

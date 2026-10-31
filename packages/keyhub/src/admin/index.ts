@@ -10,7 +10,7 @@ import { createServer as createSecureServer } from 'node:https'
 import { isIP } from 'node:net'
 import { networkInterfaces } from 'node:os'
 import { resolve } from 'node:path'
-import { encodeAccessCode } from '../access-code.ts'
+import { encodeAccessCode, encodeRelayUpdate } from '../access-code.ts'
 import type { AdminConfig } from '../config.ts'
 import { PLUGIN_VERSION } from '../version.ts'
 import { BalanceMonitor } from './balance.ts'
@@ -115,11 +115,7 @@ export async function applyAdmin(ctx: Context, config: AdminConfig): Promise<voi
   })
 
   ctx.effect(() => {
-    let version = ledger.dataVersion()
     const timer = setInterval(() => {
-      const next = ledger.dataVersion()
-      if (next === version) return
-      version = next
       recheckInFlight()
     }, LEDGER_POLL_MS)
     return () => { clearInterval(timer) }
@@ -163,6 +159,7 @@ export async function applyAdmin(ctx: Context, config: AdminConfig): Promise<voi
     service: {
       relayURL: relayOrigin(config),
       fingerprint,
+      relayUpdateCode: encodeRelayUpdate({ relayURL: relayOrigin(config), fingerprint }),
       upstreamBaseURL: config.upstreamBaseURL,
       timeZone: config.timeZone,
       defaultMaxConcurrency: config.defaultMaxConcurrency,
